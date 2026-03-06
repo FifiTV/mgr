@@ -1,0 +1,4 @@
+# Place raw CT images here
+# Structure:
+# - Target/ (clean images)
+# - Baseline/ (images with artifacts)

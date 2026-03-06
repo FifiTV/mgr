@@ -1,0 +1,82 @@
+[dataset]
+# Dataset configuration
+batch_size = 2
+img_size = 512
+num_workers = 2
+pin_memory = true
+persistent_workers = true
+
+# Data paths (relative to project root)
+raw_data_path = "data/raw"
+processed_data_path = "data/processed"
+
+[training]
+# Common training parameters
+epochs = 5
+learning_rate = 3e-3
+beta1 = 0.5
+beta2 = 0.999
+device = "cuda"  # "cuda" or "cpu"
+
+# Model save paths
+model_save_dir = "results/models"
+log_dir = "results/logs"
+
+[cyclegan]
+# CycleGAN-specific parameters
+enabled = true
+n_residual_blocks = 9
+lambda_cycle = 10.0
+lambda_identity = 5.0
+lambda_supervised = 100.0
+n_epochs = 5
+learning_rate = 3e-3
+
+[diffusion]
+# Diffusion model-specific parameters
+enabled = true
+time_steps = 1000
+time_emb_dim = 32
+n_epochs = 50
+learning_rate = 3e-4  # Usually lower for diffusion
+
+[models]
+# Generator architecture
+generator_input_nc = 3
+generator_output_nc = 1
+generator_n_residual = 9
+
+# Discriminator architecture
+discriminator_input_nc = 1
+
+# Diffusion U-Net
+unet_input_channels = 4
+unet_output_channels = 1
+unet_time_emb_dim = 32
+
+[paths]
+# Output paths
+results_dir = "results"
+checkpoint_dir = "results/models"
+sample_dir = "results/samples"
+log_file = "results/logs/training.log"
+
+[data]
+# CT image parameters
+image_shape = [512, 512]
+dtype = "float32"
+
+# Metal artifact detection thresholds
+metal_threshold_hu = 2500.0
+noise_threshold_hu = 80.0
+hard_threshold_hu = 80.0
+
+# Scaling method for masks: "tanh" or "log"
+scaling_method = "log"
+tanh_scale = 80.0
+
+[preprocessing]
+# Normalization for CT images
+normalize_hu = true
+min_max_normalization = true
+label_mode = "soft"  # "soft" or "hard"
