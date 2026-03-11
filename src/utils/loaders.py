@@ -3,16 +3,39 @@ Data loader creation and dataset utilities.
 """
 
 import logging
-from typing import Tuple
+from typing import Tuple, List, Dict
 from torch.utils.data import DataLoader
 
 from src.datasets import CTDataset, LabelMode, ScalingMethod
+from src.utils.data_sources import load_data_source
 
 
 logger = logging.getLogger(__name__)
 
 
-def create_data_loaders(config: dict, dataset_metadata: list, 
+def load_dataset_metadata(data_source: str = 'rpi', base_path: str = 'data/raw') -> List[Dict[str, str]]:
+    """
+    Load metadata for specified data source.
+    
+    Args:
+        data_source: Data source to load ('real', 'rpi', or 'both')
+        base_path: Base data directory path
+        
+    Returns:
+        List of metadata dictionaries with 'clear_path', 'art_path', 'id', 'source' keys
+    """
+    logger.info(f"Loading metadata from data source: {data_source}")
+    
+    try:
+        metadata = load_data_source(source=data_source, base_path=base_path)
+        logger.info(f"Loaded {len(metadata)} metadata entries from {data_source}")
+        return metadata
+    except Exception as e:
+        logger.error(f"Failed to load data source '{data_source}': {e}")
+        raise
+
+
+def create_data_loaders(config: dict, dataset_metadata: list,
                        batch_size: int, num_workers: int) -> Tuple[DataLoader, DataLoader]:
     """
     Create data loaders for soft and hard label modes.
