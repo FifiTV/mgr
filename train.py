@@ -15,7 +15,7 @@ import os
 import warnings
 
 from src.utils import (
-    load_config, setup_device, create_dataset_metadata, create_data_loaders
+    load_config, setup_device, load_dataset_metadata, create_data_loaders
 )
 from src.training import train_cyclegan, train_diffusion
 
@@ -43,10 +43,16 @@ def main():
         help='Model type: cycle (CycleGAN) or diff (Diffusion)'
     )
     parser.add_argument(
+        '--data-source',
+        choices=['real', 'rpi', 'both'],
+        default='rpi',
+        help='Data source to use: real (CT images), rpi (simulations), both (combined)'
+    )
+    parser.add_argument(
         '--data-path',
         type=str,
         default='data/raw',
-        help='Path to dataset'
+        help='Path to dataset base directory (contains real/ and RPI/ subdirs)'
     )
     parser.add_argument(
         '--config',
@@ -82,8 +88,11 @@ def main():
     os.makedirs(config['models']['model_save_dir'], exist_ok=True)
     os.makedirs(config['models']['log_dir'], exist_ok=True)
     
-    logger.info(f"Loading dataset from {args.data_path}...")
-    dataset_metadata = create_dataset_metadata(args.data_path)
+    logger.info(f"Loading dataset from source '{args.data_source}' ({args.data_path})...")
+    dataset_metadata = load_dataset_metadata(
+        data_source=args.data_source,
+        base_path=args.data_path
+    )
     logger.info(f"Loaded {len(dataset_metadata)} image pairs")
     
     # Create data loaders
