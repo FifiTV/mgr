@@ -5,7 +5,8 @@ Utility functions for training, metrics, and visualization.
 from .metrics import calculate_psnr
 from .data_utils import load_raw_image, get_id_from_filename, create_dataset_metadata
 from .config import load_config, setup_device
-from .loaders import create_data_loaders
+from .loaders import create_data_loaders, load_dataset_metadata
+from .data_sources import DataSourceManager, load_data_source
 from .visualization import (
     plot_training_history_cyclegan,
     plot_training_history_diffusion,
@@ -20,6 +21,9 @@ __all__ = [
     "load_config",
     "setup_device",
     "create_data_loaders",
+    "load_dataset_metadata",
+    "DataSourceManager",
+    "load_data_source",
     "plot_training_history_cyclegan",
     "plot_training_history_diffusion",
     "visualize_predictions",
