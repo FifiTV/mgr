@@ -9,7 +9,7 @@ import torch
 import torch.optim as optim
 from torch.utils.data import DataLoader
 
-from src.models import ConditionalUnet, DiffusionModel
+from src.models.diffusion import DiffusionModel, DiffusionArchitecture
 
 
 logger = logging.getLogger(__name__)
@@ -35,18 +35,22 @@ def train_diffusion(dataloader_soft: DataLoader, dataloader_hard: DataLoader,
     # Configuration
     epochs = config['diffusion']['n_epochs']
     lr = config['diffusion']['learning_rate']
+    architecture = config['diffusion'].get('architecture', 'light')  # light or standard
     
-    # Initialize model
-    unet = ConditionalUnet(
+    logger.info(f"Using diffusion architecture: {architecture.upper()}")
+    
+    # Initialize model (DiffusionModel now creates the appropriate U-Net)
+    diffusion = DiffusionModel(
+        architecture=architecture,
+        time_steps=1000,
+        device=device,
         input_channels=config['models']['unet_input_channels'],
-        output_channels=config['models']['unet_output_channels'],
-        time_emb_dim=config['models']['unet_time_emb_dim']
-    ).to(device)
+        output_channels=config['models']['unet_output_channels']
+    )
     
-    diffusion = DiffusionModel(unet, time_steps=1000, device=device)
     optimizer = optim.Adam(diffusion.parameters(), lr=lr)
     
-    logger.info(f"Models initialized. Training for {epochs} epochs...")
+    logger.info(f"Diffusion model initialized ({architecture}). Training for {epochs} epochs...")
     
     # Train both soft and hard versions
     for mode_name, dataloader in [("SOFT", dataloader_soft), ("HARD", dataloader_hard)]:

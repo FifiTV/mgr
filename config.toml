@@ -35,6 +35,7 @@ learning_rate = 3e-3
 [diffusion]
 # Diffusion model-specific parameters
 enabled = true
+architecture = "light"      # "light" (original, faster) or "standard" (SOTA, better quality)
 time_steps = 1000
 time_emb_dim = 32
 n_epochs = 50
