@@ -1,5 +1,6 @@
 """
 Diffusion Model architecture for metal artifact reduction.
+Supports both light and standard U-Net architectures.
 """
 
 import math
@@ -7,6 +8,13 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import Tuple
+from enum import Enum
+
+
+class DiffusionArchitecture(Enum):
+    """Available diffusion model architectures."""
+    LIGHT = "light"       # Lightweight U-Net (test)
+    STANDARD = "standard" # Advanced U-Net (Standard)
 
 
 class SinusoidalPositionEmbeddings(nn.Module):
@@ -60,10 +68,11 @@ class Block(nn.Module):
         return self.conv(x)
 
 
-class ConditionalUnet(nn.Module):
+class ConditionalUnetLight(nn.Module):
     """
-    Conditional U-Net for diffusion model.
+    Lightweight Conditional U-Net for diffusion model (original).
     Takes noisy image and condition tensors (clean image, masks).
+    Good for limited GPU memory.
     """
     
     def __init__(self, input_channels: int = 4, output_channels: int = 1, 
@@ -151,17 +160,32 @@ class ConditionalUnet(nn.Module):
 class DiffusionModel(nn.Module):
     """
     Diffusion model wrapper managing noise schedules and diffusion process.
+    Automatically selects appropriate U-Net architecture.
     """
     
-    def __init__(self, model: nn.Module, time_steps: int = 1000, device: str = "cuda"):
+    def __init__(self, architecture: str = "light", time_steps: int = 1000, 
+                 device: str = "cuda", input_channels: int = 4, 
+                 output_channels: int = 1):
         """
         Args:
-            model: U-Net model for noise prediction
+            architecture: U-Net architecture ('light' or 'standard')
             time_steps: Number of diffusion steps
             device: Device for computation ("cuda" or "cpu")
+            input_channels: Number of input channels
+            output_channels: Number of output channels
         """
         super().__init__()
-        self.model = model.to(device)
+        
+        # Build appropriate U-Net model
+        arch_lower = architecture.lower()
+        if arch_lower == "light":
+            self.model = ConditionalUnetLight(input_channels, output_channels).to(device)
+        elif arch_lower == "standard":
+            self.model = ConditionalUnetStandard(input_channels, output_channels).to(device)
+        else:
+            raise ValueError(f"Unknown architecture: {architecture}. Use 'light' or 'standard'")
+        
+        self.architecture = arch_lower
         self.time_steps = time_steps
         self.device = device
 
@@ -213,9 +237,164 @@ class DiffusionModel(nn.Module):
         # Model input: noisy image + conditions
         model_input = torch.cat((x_t, condition_tensor), dim=1)
 
-        # Predict noise
-        noise_pred = self.model(model_input, t)
+        # Predict noise (architecture-specific forward pass)
+        if self.architecture == "light":
+            noise_pred = self.model(model_input, t)
+        else:  # standard
+            # Standard model has sinusoidal embeddings built-in
+            noise_pred = self.model(model_input, t)
 
         # MSE loss
         loss = F.mse_loss(noise_pred, noise)
         return loss
+
+
+# Standard
+class ResnetBlock(nn.Module):
+    """ResNet block for advanced diffusion model with time injection."""
+    
+    def __init__(self, in_channels: int, out_channels: int, time_emb_dim: int):
+        super().__init__()
+        self.time_mlp = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(time_emb_dim, out_channels)
+        )
+        
+        self.conv1 = nn.Conv2d(in_channels, out_channels, 3, padding=1)
+        self.norm1 = nn.GroupNorm(8, out_channels)
+        self.conv2 = nn.Conv2d(out_channels, out_channels, 3, padding=1)
+        self.norm2 = nn.GroupNorm(8, out_channels)
+        self.silu = nn.SiLU()
+
+        # Residual connection (handles channel changes)
+        self.shortcut = nn.Conv2d(in_channels, out_channels, 1) if in_channels != out_channels else nn.Identity()
+
+    def forward(self, x: torch.Tensor, t_emb: torch.Tensor) -> torch.Tensor:
+        h = self.conv1(x)
+        h = self.norm1(h)
+        h = self.silu(h)
+
+        # Time injection
+        time_emb = self.time_mlp(t_emb)
+        time_emb = time_emb[(...,) + (None,) * 2]  # (B, C) -> (B, C, 1, 1)
+        h = h + time_emb
+
+        h = self.conv2(h)
+        h = self.norm2(h)
+        h = self.silu(h)
+
+        return h + self.shortcut(x)
+
+
+class AttentionBlock(nn.Module):
+    """Self-Attention block for capturing global context."""
+    
+    def __init__(self, channels: int):
+        super().__init__()
+        self.norm = nn.GroupNorm(8, channels)
+        self.qkv = nn.Conv2d(channels, channels * 3, 1)
+        self.proj = nn.Conv2d(channels, channels, 1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B, C, H, W = x.shape
+        h = self.norm(x)
+        qkv = self.qkv(h).view(B, 3, C, H * W)
+        q, k, v = qkv.unbind(1)
+        
+        # Attention computation
+        attn = (q.transpose(-2, -1) @ k) * (C ** -0.5)
+        attn = F.softmax(attn, dim=-1)
+        
+        out = (v @ attn.transpose(-2, -1)).view(B, C, H, W)
+        return x + self.proj(out)
+
+
+class ConditionalUnetStandard(nn.Module):
+    """
+    Advanced Conditional U-Net with ResBlocks and Self-Attention (SOTA).
+    Better quality than light version, requires more GPU memory.
+    """
+    
+    def __init__(self, input_channels: int = 4, output_channels: int = 1, 
+                 time_emb_dim: int = 256):
+        super().__init__()
+
+        # Time embedding with sinusoidal + MLP
+        self.sinusoidal_emb = SinusoidalPositionEmbeddings(time_emb_dim)
+        self.time_mlp = nn.Sequential(
+            nn.Linear(time_emb_dim, time_emb_dim * 4),
+            nn.SiLU(),
+            nn.Linear(time_emb_dim * 4, time_emb_dim * 4)
+        )
+        time_dim = time_emb_dim * 4
+
+        # Encoder (ResNet blocks instead of simple convolutions)
+        self.init_conv = nn.Conv2d(input_channels, 64, kernel_size=3, padding=1)
+        
+        self.down1 = ResnetBlock(64, 128, time_dim)
+        self.down2 = ResnetBlock(128, 256, time_dim)
+        self.down3 = ResnetBlock(256, 512, time_dim)
+
+        # Bottleneck (with Self-Attention)
+        self.bot1 = ResnetBlock(512, 512, time_dim)
+        self.bot_attn = AttentionBlock(512)
+        self.bot2 = ResnetBlock(512, 512, time_dim)
+
+        # Decoder (with enlarged inputs for skip connections)
+        self.up1 = ResnetBlock(512 + 256, 256, time_dim) 
+        self.up2 = ResnetBlock(256 + 128, 128, time_dim)
+        self.up3 = ResnetBlock(128 + 64, 64, time_dim)
+
+        self.out = nn.Conv2d(64, output_channels, 1)
+
+        # Pooling and upsampling
+        self.max_pool = nn.MaxPool2d(2)
+        self.upsample = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
+
+    def forward(self, x: torch.Tensor, t: torch.Tensor, t_emb: torch.Tensor = None) -> torch.Tensor:
+        """
+        Forward pass.
+        
+        Args:
+            x: Input tensor (noisy image + conditions)
+            t: Timestep indices or embeddings
+            t_emb: Optional pre-computed time embeddings
+            
+        Returns:
+            Predicted noise
+        """
+        # Generate time embeddings if not provided
+        if t_emb is None:
+            if isinstance(t, torch.Tensor) and t.dtype in [torch.int32, torch.int64]:
+                # If t is indices, generate embeddings
+                t_emb = self.sinusoidal_emb(t)
+            else:
+                t_emb = t
+        
+        t_emb = self.time_mlp(t_emb)
+
+        # Encoder
+        x0 = self.init_conv(x)                       # (B, 64, H, W)
+        x1 = self.down1(self.max_pool(x0), t_emb)    # (B, 128, H/2, W/2)
+        x2 = self.down2(self.max_pool(x1), t_emb)    # (B, 256, H/4, W/4)
+        x3 = self.down3(self.max_pool(x2), t_emb)    # (B, 512, H/8, W/8)
+
+        # Bottleneck
+        x4 = self.bot1(x3, t_emb)                    # (B, 512, H/8, W/8)
+        x4 = self.bot_attn(x4)                       # (B, 512, H/8, W/8)
+        x4 = self.bot2(x4, t_emb)                    # (B, 512, H/8, W/8)
+
+        # Decoder with skip connections
+        x = self.upsample(x4)                        
+        x = torch.cat((x, x2), dim=1)                # Skip from x2
+        x = self.up1(x, t_emb)                       # (B, 256, H/4, W/4)
+
+        x = self.upsample(x)                         
+        x = torch.cat((x, x1), dim=1)                # Skip from x1
+        x = self.up2(x, t_emb)                       # (B, 128, H/2, W/2)
+
+        x = self.upsample(x)                         
+        x = torch.cat((x, x0), dim=1)                # Skip from x0
+        x = self.up3(x, t_emb)                       # (B, 64, H, W)
+        
+        return self.out(x)
