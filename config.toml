@@ -35,7 +35,7 @@ learning_rate = 3e-3
 [diffusion]
 # Diffusion model-specific parameters
 enabled = true
-architecture = "light"      # "light" (original, faster) or "standard" (SOTA, better quality)
+architecture = "standard"      # "light" (original, faster) or "standard" (SOTA, better quality)
 time_steps = 1000
 time_emb_dim = 32
 n_epochs = 50
@@ -68,7 +68,7 @@ image_shape = [512, 512]
 dtype = "float32"
 
 # Metal artifact detection thresholds
-metal_threshold_hu = 2500.0
+metal_threshold_hu = 1000.0
 noise_threshold_hu = 80.0
 hard_threshold_hu = 80.0
 
