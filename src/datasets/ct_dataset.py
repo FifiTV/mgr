@@ -130,20 +130,17 @@ class CTDataset(Dataset):
         Returns:
             Tuple of (metal_mask, artifact_mask)
         """
-        # Metal mask: high intensity values
-        metal_mask = (art_img > self.metal_threshold).astype(np.float32)
-        
-        # Compute difference excluding metal regions
-        diff_abs = np.abs(art_img - clear_img)
-        not_metal = 1.0 - metal_mask
-        diff_nometal = diff_abs * not_metal
-        
-        # Artifact mask depends on label mode
+        diff = np.abs(art_img - clear_img)
+
+        # Metal mask: large local difference indicates metal implant
+        metal_mask = (diff > self.metal_threshold).astype(np.float32)
+
+        # Artifact mask based on full difference
         if self.label_mode == LabelMode.HARD:
-            artifact_mask = (diff_nometal > self.hard_threshold_hu).astype(np.float32)
+            artifact_mask = (diff > self.hard_threshold_hu).astype(np.float32)
         else:
-            artifact_mask = self.compute_soft_mask(diff_nometal).astype(np.float32)
-        
+            artifact_mask = self.compute_soft_mask(diff).astype(np.float32)
+
         return metal_mask, artifact_mask
 
     def __getitem__(self, index: int) -> Dict[str, torch.Tensor]:

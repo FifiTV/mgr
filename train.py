@@ -85,37 +85,51 @@ def main():
     
     # Setup
     device = setup_device()
-    os.makedirs(config['models']['model_save_dir'], exist_ok=True)
-    os.makedirs(config['models']['log_dir'], exist_ok=True)
-    
-    logger.info(f"Loading dataset from source '{args.data_source}' ({args.data_path})...")
-    dataset_metadata = load_dataset_metadata(
-        data_source=args.data_source,
-        base_path=args.data_path
-    )
-    logger.info(f"Loaded {len(dataset_metadata)} image pairs")
-    
-    # Create data loaders
-    dataloader_soft, dataloader_hard = create_data_loaders(
-        config,
-        dataset_metadata,
-        config['dataset']['batch_size'],
-        config['dataset']['num_workers']
-    )
+    os.makedirs(config['training']['model_save_dir'], exist_ok=True)
+    os.makedirs(config['training']['log_dir'], exist_ok=True)
     
     # Train
     try:
         if args.type == 'cycle':
+            # CycleGAN uses mixed data strategy internally:
+            # Generator: RPI only (controlled artifacts)
+            # Discriminator: Real+RPI (realistic patterns)
+            # Validation: Real+RPI (quality verification)
+            logger.info("Training CycleGAN with mixed data strategy...")
+            logger.info("  Generator:     RPI (controlled artifacts)")
+            logger.info("  Discriminator: Real+RPI (realistic patterns)")
+            logger.info("  Validation:    Real+RPI (quality check)")
+            
             train_cyclegan(
-                dataloader_soft, dataloader_hard,
-                config, device,
-                config['models']['model_save_dir']
+                config=config,
+                device=device,
+                output_dir=config['training']['model_save_dir'],
+                gen_data_source='rpi',
+                disc_data_source='both',
+                val_data_source='both',
+                data_path=args.data_path
             )
         elif args.type == 'diff':
+            logger.info(f"Loading dataset from source '{args.data_source}' ({args.data_path})...")
+            dataset_metadata = load_dataset_metadata(
+                data_source=args.data_source,
+                base_path=args.data_path
+            )
+            logger.info(f"Loaded {len(dataset_metadata)} image pairs")
+            
+            # Create data loaders for Diffusion
+            dataloader_soft, dataloader_hard = create_data_loaders(
+                config,
+                dataset_metadata,
+                config['dataset']['batch_size'],
+                config['dataset']['num_workers']
+            )
+            
             train_diffusion(
                 dataloader_soft, dataloader_hard,
                 config, device,
-                config['models']['model_save_dir']
+                config['training']['model_save_dir'],
+                data_source=args.data_source
             )
         
         logger.info("Training completed successfully!")
