@@ -88,11 +88,19 @@ def main():
     os.makedirs(config['training']['model_save_dir'], exist_ok=True)
     os.makedirs(config['training']['log_dir'], exist_ok=True)
     
-    # Read RPI folder splits from config (optional section)
+    # Read split config (optional section)
     rpi_splits = config.get('rpi_splits', {})
-    rpi_train_variants = rpi_splits.get('train') or None
-    rpi_val_variants = rpi_splits.get('val') or None
-    rpi_test_variants = rpi_splits.get('test') or None
+
+    rpi_train_variants  = rpi_splits.get('train') or None
+    rpi_val_variants    = rpi_splits.get('val')   or None
+    rpi_test_variants   = rpi_splits.get('test')  or None
+
+    real_train_min = rpi_splits.get('real_metal_train_min') or None
+    real_train_max = rpi_splits.get('real_metal_train_max') or None
+    real_val_min   = rpi_splits.get('real_metal_val_min')   or None
+    real_val_max   = rpi_splits.get('real_metal_val_max')   or None
+    real_test_min  = rpi_splits.get('real_metal_test_min')  or None
+    real_test_max  = rpi_splits.get('real_metal_test_max')  or None
 
     if rpi_train_variants:
         logger.info(f"RPI splits — train: {rpi_train_variants}")
@@ -100,6 +108,12 @@ def main():
         logger.info(f"RPI splits — val:   {rpi_val_variants}")
     if rpi_test_variants:
         logger.info(f"RPI splits — test:  {rpi_test_variants}")
+    if real_train_max:
+        logger.info(f"Real metal ID — train: {real_train_min or 1}–{real_train_max}")
+    if real_val_max or real_val_min:
+        logger.info(f"Real metal ID — val:   {real_val_min or 1}–{real_val_max or '∞'}")
+    if real_test_min:
+        logger.info(f"Real metal ID — test:  {real_test_min}–{real_test_max or '∞'}")
 
     # Train
     try:
@@ -123,6 +137,10 @@ def main():
                 data_path=args.data_path,
                 rpi_train_variants=rpi_train_variants,
                 rpi_val_variants=rpi_val_variants,
+                real_train_metal_min=real_train_min,
+                real_train_metal_max=real_train_max,
+                real_val_metal_min=real_val_min,
+                real_val_metal_max=real_val_max,
             )
         elif args.type == 'diff':
             logger.info(f"Loading dataset from source '{args.data_source}' ({args.data_path})...")
@@ -130,6 +148,8 @@ def main():
                 data_source=args.data_source,
                 base_path=args.data_path,
                 rpi_variants=rpi_train_variants,
+                metal_id_min=real_train_min,
+                metal_id_max=real_train_max,
             )
             logger.info(f"Loaded {len(dataset_metadata)} image pairs")
             

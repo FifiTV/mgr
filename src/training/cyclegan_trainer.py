@@ -5,6 +5,7 @@ CycleGAN training module.
 import logging
 import os
 import json
+from typing import Optional
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -31,6 +32,10 @@ def train_cyclegan(
     compute_metrics: bool = False,
     rpi_train_variants=None,
     rpi_val_variants=None,
+    real_train_metal_min: Optional[int] = None,
+    real_train_metal_max: Optional[int] = None,
+    real_val_metal_min: Optional[int] = None,
+    real_val_metal_max: Optional[int] = None,
 ) -> None:
     """
     Train CycleGAN model with mixed data sources.
@@ -72,9 +77,21 @@ def train_cyclegan(
     
     # Load metadata for separate roles
     logger.info(f"\nLoading datasets...")
-    gen_metadata = load_dataset_metadata(gen_data_source, data_path, rpi_variants=rpi_train_variants)
-    disc_metadata = load_dataset_metadata(disc_data_source, data_path, rpi_variants=rpi_train_variants)
-    val_metadata = load_dataset_metadata(val_data_source, data_path, rpi_variants=rpi_val_variants)
+    gen_metadata = load_dataset_metadata(
+        gen_data_source, data_path,
+        rpi_variants=rpi_train_variants,
+        metal_id_min=real_train_metal_min, metal_id_max=real_train_metal_max,
+    )
+    disc_metadata = load_dataset_metadata(
+        disc_data_source, data_path,
+        rpi_variants=rpi_train_variants,
+        metal_id_min=real_train_metal_min, metal_id_max=real_train_metal_max,
+    )
+    val_metadata = load_dataset_metadata(
+        val_data_source, data_path,
+        rpi_variants=rpi_val_variants,
+        metal_id_min=real_val_metal_min, metal_id_max=real_val_metal_max,
+    )
     
     logger.info(f"  Generator:     {len(gen_metadata)} samples ({gen_data_source})")
     logger.info(f"  Discriminator: {len(disc_metadata)} samples ({disc_data_source})")
