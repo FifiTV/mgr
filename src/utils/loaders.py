@@ -16,7 +16,9 @@ logger = logging.getLogger(__name__)
 def load_dataset_metadata(data_source: str = 'rpi', base_path: str = 'data/raw',
                           rpi_variants: Optional[List[str]] = None,
                           metal_id_min: Optional[int] = None,
-                          metal_id_max: Optional[int] = None) -> List[Dict[str, str]]:
+                          metal_id_max: Optional[int] = None,
+                          real_path: Optional[str] = None,
+                          rpi_path: Optional[str] = None) -> List[Dict[str, str]]:
     """
     Load metadata for specified data source.
 
@@ -26,6 +28,8 @@ def load_dataset_metadata(data_source: str = 'rpi', base_path: str = 'data/raw',
         rpi_variants: List of RPI variant folder names (None = default ["body1"])
         metal_id_min: Lower bound for real image metal IDs (None / 0 = no bound)
         metal_id_max: Upper bound for real image metal IDs (None / 0 = no bound)
+        real_path: Explicit path to real images dir (overrides base_path/real)
+        rpi_path:  Explicit path to RPI dir        (overrides base_path/RPI)
 
     Returns:
         List of metadata dictionaries with 'clear_path', 'art_path', 'id', 'source' keys
@@ -36,7 +40,8 @@ def load_dataset_metadata(data_source: str = 'rpi', base_path: str = 'data/raw',
         metadata = load_data_source(source=data_source, base_path=base_path,
                                     rpi_variants=rpi_variants,
                                     metal_id_min=metal_id_min,
-                                    metal_id_max=metal_id_max)
+                                    metal_id_max=metal_id_max,
+                                    real_path=real_path, rpi_path=rpi_path)
         logger.info(f"Loaded {len(metadata)} metadata entries from {data_source}")
         return metadata
     except Exception as e:

@@ -47,11 +47,19 @@ def is_valid_image_file(filepath: Path) -> bool:
 
 class DataSourceManager:
     """Manage multiple data sources (real and RPI)."""
-    
-    def __init__(self, base_data_path: str = "data/raw"):
-        self.base_path = Path(base_data_path)
-        self.real_path = self.base_path / "real"
-        self.rpi_path = self.base_path / "RPI"
+
+    def __init__(self, base_data_path: str = "data/raw",
+                 real_path: Optional[str] = None,
+                 rpi_path: Optional[str] = None):
+        """
+        Args:
+            base_data_path: Base directory containing real/ and RPI/ subdirs.
+            real_path: Explicit path to real images dir (overrides base_data_path/real).
+            rpi_path:  Explicit path to RPI dir        (overrides base_data_path/RPI).
+        """
+        base = Path(base_data_path)
+        self.real_path = Path(real_path) if real_path else base / "real"
+        self.rpi_path  = Path(rpi_path)  if rpi_path  else base / "RPI"
     
     def verify_sources(self) -> Dict[str, bool]:
         """Check which data sources are available."""
@@ -257,21 +265,26 @@ class DataSourceManager:
 def load_data_source(source: str, base_path: str = "data/raw",
                      rpi_variants: Optional[List[str]] = None,
                      metal_id_min: Optional[int] = None,
-                     metal_id_max: Optional[int] = None) -> List[Dict[str, str]]:
+                     metal_id_max: Optional[int] = None,
+                     real_path: Optional[str] = None,
+                     rpi_path: Optional[str] = None) -> List[Dict[str, str]]:
     """
     Convenience function to load specific data source.
 
     Args:
         source: Data source to load ('real', 'rpi', or 'both')
-        base_path: Base data directory path
+        base_path: Base data directory (used when real_path / rpi_path are not given)
         rpi_variants: List of RPI variant folder names to include (None = default ["body1"])
         metal_id_min: Lower bound for real image metal IDs (None / 0 = no bound)
         metal_id_max: Upper bound for real image metal IDs (None / 0 = no bound)
+        real_path: Explicit path to real images dir (overrides base_path/real)
+        rpi_path:  Explicit path to RPI dir        (overrides base_path/RPI)
 
     Returns:
         Metadata list
     """
-    manager = DataSourceManager(base_data_path=base_path)
+    manager = DataSourceManager(base_data_path=base_path,
+                                real_path=real_path, rpi_path=rpi_path)
 
     if source == 'real':
         return manager.get_real_data(metal_id_min=metal_id_min, metal_id_max=metal_id_max)

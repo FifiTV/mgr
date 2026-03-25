@@ -51,8 +51,8 @@ def main():
     parser.add_argument(
         '--data-path',
         type=str,
-        default='data/raw',
-        help='Path to dataset base directory (contains real/ and RPI/ subdirs)'
+        default=None,
+        help='Nadpisuje paths.raw_data_path z config.toml'
     )
     parser.add_argument(
         '--config',
@@ -82,6 +82,16 @@ def main():
         config['diffusion']['n_epochs'] = args.epochs
     if args.batch_size:
         config['dataset']['batch_size'] = args.batch_size
+
+    # Resolve data paths: CLI > config [paths] > hardcoded fallback
+    paths_cfg = config.get('paths', {})
+    data_path = args.data_path or paths_cfg.get('raw_data_path', 'data/raw')
+    real_path = paths_cfg.get('real_path') or None
+    rpi_path  = paths_cfg.get('rpi_path')  or None
+
+    logger.info(f"Data paths — base: {data_path}"
+                + (f", real: {real_path}" if real_path else "")
+                + (f", rpi: {rpi_path}"   if rpi_path  else ""))
     
     # Setup
     device = setup_device()
@@ -134,22 +144,26 @@ def main():
                 gen_data_source='rpi',
                 disc_data_source='both',
                 val_data_source='both',
-                data_path=args.data_path,
+                data_path=data_path,
                 rpi_train_variants=rpi_train_variants,
                 rpi_val_variants=rpi_val_variants,
                 real_train_metal_min=real_train_min,
                 real_train_metal_max=real_train_max,
                 real_val_metal_min=real_val_min,
                 real_val_metal_max=real_val_max,
+                real_path=real_path,
+                rpi_path=rpi_path,
             )
         elif args.type == 'diff':
-            logger.info(f"Loading dataset from source '{args.data_source}' ({args.data_path})...")
+            logger.info(f"Loading dataset from source '{args.data_source}' ({data_path})...")
             dataset_metadata = load_dataset_metadata(
                 data_source=args.data_source,
-                base_path=args.data_path,
+                base_path=data_path,
                 rpi_variants=rpi_train_variants,
                 metal_id_min=real_train_min,
                 metal_id_max=real_train_max,
+                real_path=real_path,
+                rpi_path=rpi_path,
             )
             logger.info(f"Loaded {len(dataset_metadata)} image pairs")
             

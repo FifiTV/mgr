@@ -6,10 +6,6 @@ num_workers = 2
 pin_memory = true
 persistent_workers = true
 
-# Data paths (relative to project root)
-raw_data_path = "data/raw"
-processed_data_path = "data/processed"
-
 [training]
 # Common training parameters
 epochs = 5
@@ -56,11 +52,16 @@ unet_output_channels = 1
 unet_time_emb_dim = 32
 
 [paths]
+# Input data paths (relative to project root or absolute)
+raw_data_path = "data/raw"
+rpi_path      = "data/raw/RPI"
+real_path     = "data/raw/real"
+
 # Output paths
-results_dir = "results"
+results_dir    = "results"
 checkpoint_dir = "results/models"
-sample_dir = "results/samples"
-log_file = "results/logs/training.log"
+sample_dir     = "results/samples"
+log_file       = "results/logs/training.log"
 
 [data]
 # CT image parameters

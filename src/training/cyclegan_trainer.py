@@ -36,6 +36,8 @@ def train_cyclegan(
     real_train_metal_max: Optional[int] = None,
     real_val_metal_min: Optional[int] = None,
     real_val_metal_max: Optional[int] = None,
+    real_path: Optional[str] = None,
+    rpi_path: Optional[str] = None,
 ) -> None:
     """
     Train CycleGAN model with mixed data sources.
@@ -81,16 +83,19 @@ def train_cyclegan(
         gen_data_source, data_path,
         rpi_variants=rpi_train_variants,
         metal_id_min=real_train_metal_min, metal_id_max=real_train_metal_max,
+        real_path=real_path, rpi_path=rpi_path,
     )
     disc_metadata = load_dataset_metadata(
         disc_data_source, data_path,
         rpi_variants=rpi_train_variants,
         metal_id_min=real_train_metal_min, metal_id_max=real_train_metal_max,
+        real_path=real_path, rpi_path=rpi_path,
     )
     val_metadata = load_dataset_metadata(
         val_data_source, data_path,
         rpi_variants=rpi_val_variants,
         metal_id_min=real_val_metal_min, metal_id_max=real_val_metal_max,
+        real_path=real_path, rpi_path=rpi_path,
     )
     
     logger.info(f"  Generator:     {len(gen_metadata)} samples ({gen_data_source})")
