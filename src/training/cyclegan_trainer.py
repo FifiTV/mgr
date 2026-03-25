@@ -27,7 +27,8 @@ def train_cyclegan(
     gen_data_source: str = 'rpi',
     disc_data_source: str = 'both',
     val_data_source: str = 'both',
-    data_path: str = 'data/raw'
+    data_path: str = 'data/raw',
+    compute_metrics: bool = False
 ) -> None:
     """
     Train CycleGAN model with mixed data sources.
@@ -151,7 +152,8 @@ def train_cyclegan(
         }
         
         # Setup mixed precision training if CUDA available
-        scaler = torch.amp.GradScaler('cuda') if torch.cuda.is_available() else None
+        # init_scale=256 prevents float16 overflow in early training (default 65536 can cause NaN)
+        scaler = torch.amp.GradScaler('cuda', init_scale=256.0) if torch.cuda.is_available() else None
 
         # Precompute discriminator patch shape to avoid redundant forward passes per batch
         with torch.no_grad():
@@ -298,41 +300,58 @@ def train_cyclegan(
                     loss_D_B.backward()
                     optimizer_D_B.step()
                 
-                # Accumulate metrics
-                psnr = calculate_psnr(fake_B.detach(), real_B_gen).item()
+                # Accumulate losses
                 epoch_g_loss += loss_G.item()
                 epoch_d_loss += (loss_D_A.item() + loss_D_B.item())
                 epoch_sup_loss += loss_supervised.item()
-                epoch_psnr += psnr
+                if compute_metrics:
+                    psnr = calculate_psnr(fake_B.detach().float(), real_B_gen.float()).item()
+                    epoch_psnr += psnr
                 batch_count += 1
-                
+
                 if (batch_idx + 1) % 10 == 0:
-                    logger.info(
-                        f"[Epoch {epoch + 1}/{epochs}] "
-                        f"[Batch {batch_idx + 1}/{len(gen_loader)}] "
-                        f"[G: {loss_G.item():.4f}] "
-                        f"[D: {(loss_D_A.item() + loss_D_B.item()):.4f}] "
-                        f"[PSNR: {psnr:.2f} dB]"
-                    )
-            
+                    if compute_metrics:
+                        logger.info(
+                            f"[Epoch {epoch + 1}/{epochs}] "
+                            f"[Batch {batch_idx + 1}/{len(gen_loader)}] "
+                            f"[G: {loss_G.item():.4f}] "
+                            f"[D: {(loss_D_A.item() + loss_D_B.item()):.4f}] "
+                            f"[PSNR: {psnr:.2f} dB]"
+                        )
+                    else:
+                        logger.info(
+                            f"[Epoch {epoch + 1}/{epochs}] "
+                            f"[Batch {batch_idx + 1}/{len(gen_loader)}] "
+                            f"[G: {loss_G.item():.4f}] "
+                            f"[D: {(loss_D_A.item() + loss_D_B.item()):.4f}]"
+                        )
+
             # Epoch statistics
             avg_g_loss = epoch_g_loss / batch_count
             avg_d_loss = epoch_d_loss / batch_count
             avg_sup_loss = epoch_sup_loss / batch_count
-            avg_psnr = epoch_psnr / batch_count
-            
+
             history['G_loss'].append(avg_g_loss)
             history['D_loss'].append(avg_d_loss)
             history['Sup_loss'].append(avg_sup_loss)
-            history['PSNR'].append(avg_psnr)
-            
-            logger.info(
-                f"[Epoch {epoch + 1}/{epochs}] "
-                f"G_Loss: {avg_g_loss:.4f} | "
-                f"D_Loss: {avg_d_loss:.4f} | "
-                f"Sup_Loss: {avg_sup_loss:.4f} | "
-                f"PSNR: {avg_psnr:.2f} dB"
-            )
+
+            if compute_metrics:
+                avg_psnr = epoch_psnr / batch_count
+                history['PSNR'].append(avg_psnr)
+                logger.info(
+                    f"[Epoch {epoch + 1}/{epochs}] "
+                    f"G_Loss: {avg_g_loss:.4f} | "
+                    f"D_Loss: {avg_d_loss:.4f} | "
+                    f"Sup_Loss: {avg_sup_loss:.4f} | "
+                    f"PSNR: {avg_psnr:.2f} dB"
+                )
+            else:
+                logger.info(
+                    f"[Epoch {epoch + 1}/{epochs}] "
+                    f"G_Loss: {avg_g_loss:.4f} | "
+                    f"D_Loss: {avg_d_loss:.4f} | "
+                    f"Sup_Loss: {avg_sup_loss:.4f}"
+                )
         
         # Save models
         model_G_AB_path = os.path.join(output_dir, f'cyclegan_G_AB_{label_mode.lower()}.pth')
