@@ -28,7 +28,9 @@ def train_cyclegan(
     disc_data_source: str = 'both',
     val_data_source: str = 'both',
     data_path: str = 'data/raw',
-    compute_metrics: bool = False
+    compute_metrics: bool = False,
+    rpi_train_variants=None,
+    rpi_val_variants=None,
 ) -> None:
     """
     Train CycleGAN model with mixed data sources.
@@ -70,9 +72,9 @@ def train_cyclegan(
     
     # Load metadata for separate roles
     logger.info(f"\nLoading datasets...")
-    gen_metadata = load_dataset_metadata(gen_data_source, data_path)
-    disc_metadata = load_dataset_metadata(disc_data_source, data_path)
-    val_metadata = load_dataset_metadata(val_data_source, data_path)
+    gen_metadata = load_dataset_metadata(gen_data_source, data_path, rpi_variants=rpi_train_variants)
+    disc_metadata = load_dataset_metadata(disc_data_source, data_path, rpi_variants=rpi_train_variants)
+    val_metadata = load_dataset_metadata(val_data_source, data_path, rpi_variants=rpi_val_variants)
     
     logger.info(f"  Generator:     {len(gen_metadata)} samples ({gen_data_source})")
     logger.info(f"  Discriminator: {len(disc_metadata)} samples ({disc_data_source})")

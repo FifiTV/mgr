@@ -88,6 +88,19 @@ def main():
     os.makedirs(config['training']['model_save_dir'], exist_ok=True)
     os.makedirs(config['training']['log_dir'], exist_ok=True)
     
+    # Read RPI folder splits from config (optional section)
+    rpi_splits = config.get('rpi_splits', {})
+    rpi_train_variants = rpi_splits.get('train') or None
+    rpi_val_variants = rpi_splits.get('val') or None
+    rpi_test_variants = rpi_splits.get('test') or None
+
+    if rpi_train_variants:
+        logger.info(f"RPI splits — train: {rpi_train_variants}")
+    if rpi_val_variants:
+        logger.info(f"RPI splits — val:   {rpi_val_variants}")
+    if rpi_test_variants:
+        logger.info(f"RPI splits — test:  {rpi_test_variants}")
+
     # Train
     try:
         if args.type == 'cycle':
@@ -99,7 +112,7 @@ def main():
             logger.info("  Generator:     RPI (controlled artifacts)")
             logger.info("  Discriminator: Real+RPI (realistic patterns)")
             logger.info("  Validation:    Real+RPI (quality check)")
-            
+
             train_cyclegan(
                 config=config,
                 device=device,
@@ -107,13 +120,16 @@ def main():
                 gen_data_source='rpi',
                 disc_data_source='both',
                 val_data_source='both',
-                data_path=args.data_path
+                data_path=args.data_path,
+                rpi_train_variants=rpi_train_variants,
+                rpi_val_variants=rpi_val_variants,
             )
         elif args.type == 'diff':
             logger.info(f"Loading dataset from source '{args.data_source}' ({args.data_path})...")
             dataset_metadata = load_dataset_metadata(
                 data_source=args.data_source,
-                base_path=args.data_path
+                base_path=args.data_path,
+                rpi_variants=rpi_train_variants,
             )
             logger.info(f"Loaded {len(dataset_metadata)} image pairs")
             

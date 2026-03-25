@@ -81,3 +81,11 @@ tanh_scale = 80.0
 normalize_hu = true
 min_max_normalization = true
 label_mode = "soft"  # "soft" or "hard"
+
+[rpi_splits]
+# Which RPI subfolders to use for each split.
+# List specific folder names from data/raw/RPI/
+# Leave all empty [] to fall back to legacy single-variant mode (body1).
+train = ["body1", "body2", "body3", "body4", "body5", "body6"]
+val   = ["body7", "body8"]
+test  = ["body9"]
