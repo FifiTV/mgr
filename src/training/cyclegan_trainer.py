@@ -16,6 +16,7 @@ from src.models import (
 )
 from src.utils.metrics import calculate_psnr
 from src.utils import load_dataset_metadata, create_data_loaders
+from src.utils.visualization import save_cyclegan_samples
 
 
 logger = logging.getLogger(__name__)
@@ -76,6 +77,7 @@ def train_cyclegan(
     lambda_sup = config['cyclegan']['lambda_supervised']
     batch_size = config['dataset']['batch_size']
     num_workers = config['dataset']['num_workers']
+    sample_dir = config.get('paths', {}).get('sample_dir', 'results/samples')
     
     # Load metadata for separate roles
     logger.info(f"\nLoading datasets...")
@@ -333,6 +335,13 @@ def train_cyclegan(
                     epoch_psnr += psnr
                 batch_count += 1
 
+                # Keep last batch for end-of-epoch visualization
+                _last_real_A  = real_A_gen.detach()
+                _last_real_B  = real_B_gen.detach()
+                _last_fake_B  = fake_B.detach()
+                _last_mask_M  = mask_M_gen.detach()
+                _last_mask_A  = mask_A_gen.detach()
+
                 if (batch_idx + 1) % 10 == 0:
                     if compute_metrics:
                         logger.info(
@@ -349,6 +358,19 @@ def train_cyclegan(
                             f"[G: {loss_G.item():.4f}] "
                             f"[D: {(loss_D_A.item() + loss_D_B.item()):.4f}]"
                         )
+
+            # Save sample images every epoch (SOFT only — soft masks are more informative)
+            if label_mode == "SOFT":
+                save_cyclegan_samples(
+                    epoch=epoch + 1,
+                    label_mode=label_mode,
+                    real_A=_last_real_A,
+                    real_B=_last_real_B,
+                    fake_B=_last_fake_B,
+                    mask_M=_last_mask_M,
+                    mask_A=_last_mask_A,
+                    save_dir=sample_dir,
+                )
 
             # Epoch statistics
             avg_g_loss = epoch_g_loss / batch_count

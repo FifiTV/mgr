@@ -7,7 +7,7 @@ import torch
 from torch.utils.data import Dataset
 from enum import Enum
 from pathlib import Path
-from typing import Tuple, List, Dict
+from typing import Optional, Tuple, List, Dict
 
 
 class LabelMode(Enum):
@@ -39,6 +39,7 @@ class CTDataset(Dataset):
                  noise_threshold_hu: float = 80.0,
                  hard_threshold_hu: float = 80.0,
                  tanh_scale: float = 80.0,
+                 bloom_max: Optional[float] = None,
                  shape: Tuple[int, int] = (512, 512)):
         """
         Args:
@@ -49,6 +50,11 @@ class CTDataset(Dataset):
             noise_threshold_hu: Threshold for noise detection (HU units)
             hard_threshold_hu: Threshold for hard labeling
             tanh_scale: Scale factor for tanh scaling method
+            bloom_max: Global maximum bloom/artifact intensity (HU) used to anchor
+                       LOG soft-label scaling across all images.  When provided,
+                       the log mask is divided by log1p(bloom_max) instead of the
+                       per-image maximum, giving consistent label magnitudes.
+                       None → fall back to per-image normalisation (old behaviour).
             shape: Expected shape of CT images
         """
         self.data_paths = data_list
@@ -56,6 +62,7 @@ class CTDataset(Dataset):
         self.label_mode = label_mode
         self.scaling_method = scaling_method
         self.tanh_scale = tanh_scale
+        self.bloom_max = bloom_max
         self.metal_threshold = metal_threshold_hu
         self.noise_threshold = noise_threshold_hu
         self.hard_threshold_hu = hard_threshold_hu
@@ -111,9 +118,14 @@ class CTDataset(Dataset):
             return np.tanh(diff_raw / self.tanh_scale)
         elif self.scaling_method == ScalingMethod.LOG:
             weight_log = np.log1p(diff_raw)
-            max_val = weight_log.max()
-            if max_val > 1e-6:
-                return weight_log / max_val
+            if self.bloom_max is not None:
+                # Global anchor: consistent scale across all images
+                denom = np.log1p(self.bloom_max)
+            else:
+                # Per-image fallback (old behaviour)
+                denom = weight_log.max()
+            if denom > 1e-6:
+                return np.clip(weight_log / denom, 0.0, 1.0)
             return weight_log
         else:
             return diff_raw / (diff_raw.max() + 1e-6)

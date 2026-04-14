@@ -65,13 +65,15 @@ def create_data_loaders(config: dict, dataset_metadata: list,
     """
     logger.info("Creating data loaders...")
     
-    # Soft labels dataset
+    # Soft labels dataset — scale by global bloom_max when available
+    bloom_max = config['data'].get('bloom_max') or None
     dataset_soft = CTDataset(
         data_list=dataset_metadata,
         label_mode=LabelMode.SOFT,
         scaling_method=ScalingMethod.LOG,
         metal_threshold_hu=config['data']['metal_threshold_hu'],
-        tanh_scale=config['data']['tanh_scale']
+        tanh_scale=config['data']['tanh_scale'],
+        bloom_max=bloom_max,
     )
     
     dataloader_soft = DataLoader(
