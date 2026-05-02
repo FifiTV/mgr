@@ -36,8 +36,7 @@ class CTDataset(Dataset):
                  label_mode: LabelMode = LabelMode.SOFT,
                  scaling_method: ScalingMethod = ScalingMethod.LOG,
                  metal_threshold_hu: float = 2500.0,
-                 noise_threshold_hu: float = 80.0,
-                 hard_threshold_hu: float = 80.0,
+                 hard_threshold_hu: float = 100.0,
                  tanh_scale: float = 80.0,
                  bloom_max: Optional[float] = None,
                  shape: Tuple[int, int] = (512, 512)):
@@ -46,9 +45,8 @@ class CTDataset(Dataset):
             data_list: List of dicts with 'clear_path' and 'art_path' keys
             label_mode: LabelMode.SOFT or LabelMode.HARD
             scaling_method: Method for scaling artifact masks
-            metal_threshold_hu: Threshold for metal detection (HU units)
-            noise_threshold_hu: Threshold for noise detection (HU units)
-            hard_threshold_hu: Threshold for hard labeling
+            metal_threshold_hu: Threshold for metal mask (diff > this = implant voxel)
+            hard_threshold_hu: Threshold for HARD artifact mask (diff > this = artifact)
             tanh_scale: Scale factor for tanh scaling method
             bloom_max: Global maximum bloom/artifact intensity (HU) used to anchor
                        LOG soft-label scaling across all images.  When provided,
@@ -64,7 +62,6 @@ class CTDataset(Dataset):
         self.tanh_scale = tanh_scale
         self.bloom_max = bloom_max
         self.metal_threshold = metal_threshold_hu
-        self.noise_threshold = noise_threshold_hu
         self.hard_threshold_hu = hard_threshold_hu
 
     def __len__(self) -> int:
