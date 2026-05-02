@@ -179,7 +179,6 @@ def main():
                 dataloader_soft, dataloader_hard,
                 config, device,
                 config['training']['model_save_dir'],
-                data_source=args.data_source
             )
         
         logger.info("Training completed successfully!")
