@@ -75,9 +75,11 @@ def train_cyclegan(
     lambda_cyc = config['cyclegan']['lambda_cycle']
     lambda_id = config['cyclegan']['lambda_identity']
     lambda_sup = config['cyclegan']['lambda_supervised']
-    batch_size = config['dataset']['batch_size']
+    mask_dropout        = config['cyclegan'].get('mask_dropout_prob', 0.0)
+    checkpoint_interval = config['training'].get('checkpoint_interval', 10)
+    batch_size  = config['dataset']['batch_size']
     num_workers = config['dataset']['num_workers']
-    sample_dir = config.get('paths', {}).get('sample_dir', 'results/samples')
+    sample_dir  = config.get('paths', {}).get('sample_dir', 'results/samples')
     
     # Load metadata for separate roles
     logger.info(f"\nLoading datasets...")
@@ -177,9 +179,14 @@ def train_cyclegan(
             'PSNR': []
         }
         
-        # Setup mixed precision training if CUDA available
-        # init_scale=256 prevents float16 overflow in early training (default 65536 can cause NaN)
-        scaler = torch.amp.GradScaler('cuda', init_scale=256.0) if torch.cuda.is_available() else None
+        # Separate GradScalers per optimizer — sharing one scaler across multiple
+        # optimizers can cause skipped updates when one optimizer's gradients have inf/nan.
+        # init_scale left at default (65536); the previous 256 caused gradient underflow
+        # in float16 (gradients < ~2e-7 became zero → network stopped learning).
+        use_amp = torch.cuda.is_available()
+        scaler_G  = torch.amp.GradScaler('cuda') if use_amp else None
+        scaler_DA = torch.amp.GradScaler('cuda') if use_amp else None
+        scaler_DB = torch.amp.GradScaler('cuda') if use_amp else None
 
         # Precompute discriminator patch shape to avoid redundant forward passes per batch
         with torch.no_grad():
@@ -210,7 +217,16 @@ def train_cyclegan(
                 real_B_disc = disc_batch['real_B'].to(device)
                 mask_M_disc = disc_batch['mask_M'].to(device)
                 mask_A_disc = disc_batch['mask_A'].to(device)
-                
+
+                # Mask dropout: zero all G_AB mask inputs for this batch.
+                # One decision covers both gen and disc batches so D_B sees
+                # fake_B samples generated consistently (with or without masks).
+                if mask_dropout > 0.0 and torch.rand(1).item() < mask_dropout:
+                    mask_M_gen  = torch.zeros_like(mask_M_gen)
+                    mask_A_gen  = torch.zeros_like(mask_A_gen)
+                    mask_M_disc = torch.zeros_like(mask_M_disc)
+                    mask_A_disc = torch.zeros_like(mask_A_disc)
+
                 # Create valid/fake labels for discriminators
                 valid_gen = torch.ones(real_A_gen.size(0), *_patch_shape).to(device)
                 fake_gen = torch.zeros(real_A_gen.size(0), *_patch_shape).to(device)
@@ -220,83 +236,70 @@ def train_cyclegan(
                 
                 # ==================== Train Generators ====================
                 optimizer_G.zero_grad()
-                
-                if scaler:
+
+                if use_amp:
                     with torch.amp.autocast(device_type='cuda'):
-                        # Identity loss
                         loss_id_A = criterion_identity(G_BA(real_A_gen), real_A_gen) * lambda_id
-                        
-                        # Generator AB: clean image -> metallic artifact image
+
                         input_G_AB = torch.cat((real_A_gen, mask_M_gen, mask_A_gen), 1)
                         fake_B = G_AB(input_G_AB)
                         loss_GAN_AB = criterion_GAN(D_B(fake_B), valid_gen)
                         loss_supervised = criterion_supervised(fake_B, real_B_gen) * lambda_sup
-                        
-                        # Generator BA: artifact image -> clean image
+
                         fake_A = G_BA(real_B_gen)
                         loss_GAN_BA = criterion_GAN(D_A(fake_A), valid_gen)
-                        
-                        # Cycle consistency: clean -> artifact -> clean
+
                         rec_A = G_BA(fake_B)
                         loss_cycle_A = criterion_cycle(rec_A, real_A_gen) * lambda_cyc
-                        
-                        # Cycle consistency: artifact -> clean -> artifact
+
                         input_rec_B = torch.cat((fake_A, mask_M_gen, mask_A_gen), 1)
                         rec_B = G_AB(input_rec_B)
                         loss_cycle_B = criterion_cycle(rec_B, real_B_gen) * lambda_cyc
-                        
-                        loss_G = (
-                            loss_GAN_AB + loss_GAN_BA +
-                            loss_cycle_A + loss_cycle_B +
-                            loss_id_A + loss_supervised
-                        )
-                    
-                    scaler.scale(loss_G).backward()
-                    scaler.step(optimizer_G)
+
+                        loss_G = (loss_GAN_AB + loss_GAN_BA +
+                                  loss_cycle_A + loss_cycle_B +
+                                  loss_id_A + loss_supervised)
+
+                    scaler_G.scale(loss_G).backward()
+                    scaler_G.step(optimizer_G)
+                    scaler_G.update()
                 else:
-                    # Identity loss
                     loss_id_A = criterion_identity(G_BA(real_A_gen), real_A_gen) * lambda_id
-                    
-                    # Generator AB
+
                     input_G_AB = torch.cat((real_A_gen, mask_M_gen, mask_A_gen), 1)
                     fake_B = G_AB(input_G_AB)
                     loss_GAN_AB = criterion_GAN(D_B(fake_B), valid_gen)
                     loss_supervised = criterion_supervised(fake_B, real_B_gen) * lambda_sup
-                    
-                    # Generator BA
+
                     fake_A = G_BA(real_B_gen)
                     loss_GAN_BA = criterion_GAN(D_A(fake_A), valid_gen)
-                    
-                    # Cycle consistency A
+
                     rec_A = G_BA(fake_B)
                     loss_cycle_A = criterion_cycle(rec_A, real_A_gen) * lambda_cyc
-                    
-                    # Cycle consistency B
+
                     input_rec_B = torch.cat((fake_A, mask_M_gen, mask_A_gen), 1)
                     rec_B = G_AB(input_rec_B)
                     loss_cycle_B = criterion_cycle(rec_B, real_B_gen) * lambda_cyc
-                    
-                    loss_G = (
-                        loss_GAN_AB + loss_GAN_BA +
-                        loss_cycle_A + loss_cycle_B +
-                        loss_id_A + loss_supervised
-                    )
+
+                    loss_G = (loss_GAN_AB + loss_GAN_BA +
+                              loss_cycle_A + loss_cycle_B +
+                              loss_id_A + loss_supervised)
                     loss_G.backward()
                     optimizer_G.step()
-                
+
                 # ==================== Train Discriminator A ====================
                 optimizer_D_A.zero_grad()
-                
-                if scaler:
+
+                if use_amp:
                     with torch.amp.autocast(device_type='cuda'):
                         loss_real_A = criterion_GAN(D_A(real_A_disc), valid_disc)
-                        # Use fake_A from generator but detach from discriminator data
                         fake_A_disc = G_BA(real_B_disc).detach()
                         loss_fake_A = criterion_GAN(D_A(fake_A_disc), fake_disc)
                         loss_D_A = (loss_real_A + loss_fake_A) / 2
-                    
-                    scaler.scale(loss_D_A).backward()
-                    scaler.step(optimizer_D_A)
+
+                    scaler_DA.scale(loss_D_A).backward()
+                    scaler_DA.step(optimizer_D_A)
+                    scaler_DA.update()
                 else:
                     loss_real_A = criterion_GAN(D_A(real_A_disc), valid_disc)
                     fake_A_disc = G_BA(real_B_disc).detach()
@@ -304,20 +307,20 @@ def train_cyclegan(
                     loss_D_A = (loss_real_A + loss_fake_A) / 2
                     loss_D_A.backward()
                     optimizer_D_A.step()
-                
+
                 # ==================== Train Discriminator B ====================
                 optimizer_D_B.zero_grad()
-                
-                if scaler:
+
+                if use_amp:
                     with torch.amp.autocast(device_type='cuda'):
                         loss_real_B = criterion_GAN(D_B(real_B_disc), valid_disc)
                         fake_B_disc = G_AB(torch.cat((real_A_disc, mask_M_disc, mask_A_disc), 1)).detach()
                         loss_fake_B = criterion_GAN(D_B(fake_B_disc), fake_disc)
                         loss_D_B = (loss_real_B + loss_fake_B) / 2
-                    
-                    scaler.scale(loss_D_B).backward()
-                    scaler.step(optimizer_D_B)
-                    scaler.update()
+
+                    scaler_DB.scale(loss_D_B).backward()
+                    scaler_DB.step(optimizer_D_B)
+                    scaler_DB.update()
                 else:
                     loss_real_B = criterion_GAN(D_B(real_B_disc), valid_disc)
                     fake_B_disc = G_AB(torch.cat((real_A_disc, mask_M_disc, mask_A_disc), 1)).detach()
@@ -359,18 +362,30 @@ def train_cyclegan(
                             f"[D: {(loss_D_A.item() + loss_D_B.item()):.4f}]"
                         )
 
-            # Save sample images every epoch (SOFT only — soft masks are more informative)
-            if label_mode == "SOFT":
-                save_cyclegan_samples(
-                    epoch=epoch + 1,
-                    label_mode=label_mode,
-                    real_A=_last_real_A,
-                    real_B=_last_real_B,
-                    fake_B=_last_fake_B,
-                    mask_M=_last_mask_M,
-                    mask_A=_last_mask_A,
-                    save_dir=sample_dir,
+            # Save sample images every epoch (both SOFT and HARD)
+            save_cyclegan_samples(
+                epoch=epoch + 1,
+                label_mode=label_mode,
+                real_A=_last_real_A,
+                real_B=_last_real_B,
+                fake_B=_last_fake_B,
+                mask_M=_last_mask_M,
+                mask_A=_last_mask_A,
+                save_dir=sample_dir,
+            )
+
+            # Save checkpoint every checkpoint_interval epochs (0 = disabled)
+            if checkpoint_interval > 0 and (epoch + 1) % checkpoint_interval == 0:
+                ckpt_dir = os.path.join(
+                    output_dir, 'checkpoints', 'cyclegan',
+                    label_mode.lower(), f'epoch_{epoch+1:04d}'
                 )
+                os.makedirs(ckpt_dir, exist_ok=True)
+                torch.save(G_AB.state_dict(), os.path.join(ckpt_dir, 'G_AB.pth'))
+                torch.save(G_BA.state_dict(), os.path.join(ckpt_dir, 'G_BA.pth'))
+                torch.save(D_A.state_dict(),  os.path.join(ckpt_dir, 'D_A.pth'))
+                torch.save(D_B.state_dict(),  os.path.join(ckpt_dir, 'D_B.pth'))
+                logger.info(f"  Checkpoint saved: {ckpt_dir}")
 
             # Epoch statistics
             avg_g_loss = epoch_g_loss / batch_count
