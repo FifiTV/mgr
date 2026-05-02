@@ -13,6 +13,7 @@ learning_rate = 3e-3
 beta1 = 0.5
 beta2 = 0.999
 device = "cuda"  # "cuda" or "cpu"
+checkpoint_interval = 10  # save model checkpoint every N epochs (0 = disabled)
 
 # Model save paths
 model_save_dir = "results/models"
@@ -26,7 +27,8 @@ lambda_cycle = 10.0
 lambda_identity = 5.0
 lambda_supervised = 100.0
 n_epochs = 5
-learning_rate = 3e-3
+learning_rate = 2e-4  # standard CycleGAN LR; 3e-3 caused discriminator instability
+mask_dropout_prob = 0.2  # fraction of batches where G_AB mask inputs are zeroed
 
 [diffusion]
 # Diffusion model-specific parameters
@@ -34,8 +36,12 @@ enabled = true
 architecture = "standard"      # "light" (original, faster) or "standard" (SOTA, better quality)
 time_steps = 1000
 time_emb_dim = 32
-n_epochs = 50
-learning_rate = 3e-4  # Usually lower for diffusion
+n_epochs = 200                 # 50 is too few; 200-500 recommended for diffusion
+learning_rate = 1e-4           # lowered from 3e-4; more stable with longer training
+ema_decay = 0.9999             # EMA decay; 0.9999 standard for diffusion models
+lr_warmup_steps = 500          # cosine schedule warmup steps
+mask_dropout_prob = 0.3        # fraction of batches where masks are zeroed out;
+                               # teaches the model to generate without mask conditioning
 
 [models]
 # Generator architecture
@@ -69,14 +75,15 @@ image_shape = [512, 512]
 dtype = "float32"
 
 # Metal artifact detection thresholds
-metal_threshold_hu = 1000.0
-noise_threshold_hu = 80.0
-hard_threshold_hu = 80.0
+metal_threshold_hu = 2500.0   # diff threshold for metal mask; bloom_max=2040 so 2500 isolates implant
+hard_threshold_hu  = 100.0    # diff threshold for HARD artifact mask (was 80 -- raised above edge noise)
 
 # Scaling method for masks: "tanh" or "log"
 scaling_method = "log"
 tanh_scale = 80.0
 
+baseline_metalart_max = 81265.640625
+bloom_max = 2040.6845703125
 [preprocessing]
 # Normalization for CT images
 normalize_hu = true
@@ -87,8 +94,9 @@ label_mode = "soft"  # "soft" or "hard"
 # Which RPI subfolders to use for each split.
 # List specific folder names from data/raw/RPI/
 # Leave all empty [] to fall back to legacy single-variant mode (body1).
+# train = ["body1", "body2", "body3", "body4", "body5", "body6"]
 train = ["body1", "body2", "body3", "body4", "body5", "body6"]
-val   = ["body7", "body8"]
+val   = ["body7"]
 test  = ["body9"]
 
 # Real image filter: parse the number after "metal" in filenames
