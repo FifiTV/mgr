@@ -8,6 +8,7 @@ Key components:
 """
 
 import copy
+import csv
 import json
 import logging
 import os
@@ -22,7 +23,7 @@ from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import DataLoader
 
 from src.models.gaussian_unet import GaussianUNet, GaussianDDPM
-from src.datasets.gaussian_dataset import GaussianDataset, load_features_df
+from src.datasets.gaussian_dataset import GaussianDataset, load_features_df, FEATURE_COLS
 
 logger = logging.getLogger(__name__)
 
@@ -204,12 +205,15 @@ def train_gaussian(config: dict,
     metal_threshold_hu  = config.get('data', {}).get('metal_threshold_hu', 2500.0)
     checkpoint_interval = config.get('training', {}).get('checkpoint_interval', 10)
     num_workers         = config.get('dataset', {}).get('num_workers', 2)
-    sample_interval     = gaus_cfg.get('sample_interval', 20)
+    sample_interval     = gaus_cfg.get('sample_interval', 1)
+    feature_cols        = gaus_cfg.get('feature_cols', None) or FEATURE_COLS
+    y_dim               = len(feature_cols)
 
     logger.info(f"T={T}, beta_schedule={beta_schedule}, epochs={n_epochs}, "
                 f"batch={batch_size}, lr={lr}")
     logger.info(f"sigma: {sigma_max} -> {sigma_min} (cosine)")
     logger.info(f"p_random_metal={p_random_metal}, ema_decay={ema_decay}")
+    logger.info(f"feature_cols ({y_dim}): {feature_cols}")
 
     os.makedirs(output_dir, exist_ok=True)
     sample_dir = os.path.join(output_dir, 'samples', 'gaussian')
@@ -224,6 +228,7 @@ def train_gaussian(config: dict,
         features_df=features_df,
         p_random_metal=p_random_metal,
         metal_threshold_hu=metal_threshold_hu,
+        feature_cols=feature_cols,
     )
     dataloader = DataLoader(
         dataset,
@@ -240,7 +245,7 @@ def train_gaussian(config: dict,
         in_ch=3, out_ch=1,
         base_ch=base_ch,
         t_emb_dim=t_emb_dim,
-        y_dim=6,
+        y_dim=y_dim,
         attn_heads=attn_heads,
     ).to(device)
 
@@ -262,6 +267,11 @@ def train_gaussian(config: dict,
     ema       = EMA(unet, decay=ema_decay)
 
     history = {'loss': [], 'sigma': [], 'mean_weight': []}
+
+    hist_csv_path = os.path.join(output_dir, 'gaussian_history.csv')
+    with open(hist_csv_path, 'w', newline='') as _f:
+        csv.writer(_f).writerow(['epoch', 'loss', 'sigma', 'mean_weight', 'lr'])
+    logger.info(f"Metrics CSV: {hist_csv_path}")
 
     # Fixed condition batch for sample generation (grabbed on first batch)
     sample_condition: Optional[torch.Tensor] = None
@@ -331,10 +341,17 @@ def train_gaussian(config: dict,
         history['sigma'].append(sigma)
         history['mean_weight'].append(avg_wt)
 
+        current_lr = optimizer.param_groups[0]['lr']
         logger.info(
             f"[Epoch {epoch+1}/{n_epochs}] avg_loss={avg_loss:.5f}"
             f"  sigma={sigma:.4f}  mean_weight={avg_wt:.4f}"
+            f"  lr={current_lr:.2e}"
         )
+
+        with open(hist_csv_path, 'a', newline='') as _f:
+            csv.writer(_f).writerow(
+                [epoch + 1, f'{avg_loss:.6f}', f'{sigma:.6f}', f'{avg_wt:.6f}', f'{current_lr:.2e}']
+            )
 
         # ── Checkpoint ────────────────────────────────────────────────────────────
         if checkpoint_interval > 0 and (epoch + 1) % checkpoint_interval == 0:

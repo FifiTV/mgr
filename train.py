@@ -1,12 +1,13 @@
 """
 Metal Artifact Reduction Training Script
 
-Train CycleGAN and Diffusion models for CT image artifact reduction.
+Train CycleGAN, Diffusion, and Gaussian Vicinal DDPM models.
 
 Usage:
     python train.py --type cycle --epochs 5
     python train.py --type diff --epochs 50
-    python train.py --type cycle --data-path /path/to/data --config custom_config.toml
+    python train.py --type gaussian
+    python train.py --type gaussian --features-dir results --data-path data/raw/RPI
 """
 
 import argparse
@@ -17,7 +18,7 @@ import warnings
 from src.utils import (
     load_config, setup_device, load_dataset_metadata, create_data_loaders
 )
-from src.training import train_cyclegan, train_diffusion
+from src.training import train_cyclegan, train_diffusion, train_gaussian
 
 
 warnings.filterwarnings("ignore")
@@ -37,10 +38,10 @@ def main():
     )
     
     parser.add_argument(
-        '--type', 
-        choices=['cycle', 'diff'],
+        '--type',
+        choices=['cycle', 'diff', 'gaussian'],
         default='cycle',
-        help='Model type: cycle (CycleGAN) or diff (Diffusion)'
+        help='Model type: cycle (CycleGAN), diff (Diffusion), gaussian (Gaussian Vicinal DDPM)'
     )
     parser.add_argument(
         '--data-source',
@@ -70,7 +71,28 @@ def main():
         type=int,
         help='Batch size (overrides config)'
     )
-    
+    parser.add_argument(
+        '--features-dir',
+        type=str,
+        default=None,
+        help='Directory with body*/features.csv (or a single _norm.csv). '
+             'Defaults to results/ next to config.'
+    )
+    parser.add_argument(
+        '--features',
+        type=str,
+        default=None,
+        help='Comma-separated feature names for Gaussian training, e.g. '
+             '"peak_amplitude,spatial_extent,tau". Overrides config feature_cols.'
+    )
+    parser.add_argument(
+        '--output-dir',
+        type=str,
+        default=None,
+        help='Output directory for checkpoints, samples, and history. '
+             'Defaults to results/models/gaussian.'
+    )
+
     args = parser.parse_args()
     
     # Load config
@@ -80,8 +102,14 @@ def main():
     if args.epochs:
         config['cyclegan']['n_epochs'] = args.epochs
         config['diffusion']['n_epochs'] = args.epochs
+        config.setdefault('gaussian', {})['n_epochs'] = args.epochs
     if args.batch_size:
         config['dataset']['batch_size'] = args.batch_size
+        config.setdefault('gaussian', {})['batch_size'] = args.batch_size
+    if args.features:
+        config.setdefault('gaussian', {})['feature_cols'] = [
+            f.strip() for f in args.features.split(',')
+        ]
 
     # Resolve data paths: CLI > config [paths] > hardcoded fallback
     paths_cfg = config.get('paths', {})
@@ -181,8 +209,47 @@ def main():
                 config['training']['model_save_dir'],
             )
         
+        elif args.type == 'gaussian':
+            paths_cfg  = config.get('paths', {})
+            rpi_base   = rpi_path or data_path
+
+            # Resolve body dirs for training split
+            train_variants = rpi_train_variants or ['body1']
+            body_dirs = [
+                os.path.join(rpi_base, variant) for variant in train_variants
+            ]
+            logger.info(f"Gaussian — body dirs: {body_dirs}")
+
+            # Features: --features-dir > sibling 'results/' of config > results/
+            config_dir    = os.path.dirname(os.path.abspath(args.config))
+            features_dir  = args.features_dir or os.path.join(config_dir, 'results')
+            clip_stats    = os.path.join(features_dir, 'feature_clip_stats.json')
+            clip_stats    = clip_stats if os.path.exists(clip_stats) else None
+            logger.info(f"Gaussian — features_dir: {features_dir}")
+            if clip_stats:
+                logger.info(f"Gaussian — clip_stats:   {clip_stats}")
+            else:
+                logger.warning("feature_clip_stats.json not found — features must be pre-normalized")
+
+            if args.output_dir:
+                output_dir = args.output_dir
+            else:
+                output_dir = os.path.join(
+                    paths_cfg.get('results_dir', 'results'), 'models', 'gaussian'
+                )
+            logger.info(f"Gaussian — output_dir: {output_dir}")
+
+            train_gaussian(
+                config=config,
+                device=device,
+                output_dir=output_dir,
+                body_dirs=body_dirs,
+                features_source=features_dir,
+                clip_stats_path=clip_stats,
+            )
+
         logger.info("Training completed successfully!")
-    
+
     except KeyboardInterrupt:
         logger.warning("Training interrupted by user")
     except Exception as e:

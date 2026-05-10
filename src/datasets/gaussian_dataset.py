@@ -40,7 +40,7 @@ logger = logging.getLogger(__name__)
 SHAPE       = (512, 512)
 FEATURE_COLS = [
     'peak_amplitude', 'spatial_extent', 'bbox_ratio',
-    'dark_to_bright_ratio', 'angular_concentration', 'texture_roughness',
+    'dark_to_bright_ratio', 'angular_concentration', 'texture_roughness', 'tau',
 ]
 LOG_FEATURES = {'peak_amplitude', 'angular_concentration'}
 METAL_THRESHOLD_HU = 2500.0  # fallback metal mask threshold
@@ -63,10 +63,10 @@ def normalize_error(x: np.ndarray, clip: float = 3000.0) -> np.ndarray:
 # ── Feature CSV loading ──────────────────────────────────────────────────────────
 
 def _normalize_raw_features(df: pd.DataFrame, clip_stats: dict) -> pd.DataFrame:
-    """Apply clip_stats normalization (log1p + min-max) to raw feature columns."""
+    """Apply clip_stats normalization (log1p + min-max) to any column present in clip_stats."""
     df = df.copy()
-    for col in FEATURE_COLS:
-        if col not in df.columns:
+    for col in list(df.columns):
+        if col not in clip_stats:
             continue
         stats = clip_stats[col]
         if stats.get('log', False):
@@ -167,7 +167,7 @@ class GaussianDataset(Dataset):
         i_clean  : [1, 512, 512]  clean CT image normalized to [-1, 1]
         i_error  : [1, 512, 512]  I_metal - I_clean normalized to [-1, 1]
         m_metal  : [1, 512, 512]  binary metal mask [0, 1]
-        y        : [6]            normalized feature vector
+        y        : [F]            normalized feature vector (F = len(feature_cols))
 
     Directory structure per body variant:
         <body_dir>/Baseline/  training_body_metalart_imgN_512x512x1.raw
@@ -180,7 +180,8 @@ class GaussianDataset(Dataset):
                  features_df: pd.DataFrame,
                  p_random_metal: float = 0.5,
                  metal_threshold_hu: float = METAL_THRESHOLD_HU,
-                 preload: bool = False):
+                 preload: bool = False,
+                 feature_cols: Optional[List[str]] = None):
         """
         Args:
             body_dirs        : list of paths to body variant directories
@@ -189,11 +190,14 @@ class GaussianDataset(Dataset):
             metal_threshold_hu : HU threshold for fallback metal mask (when Metal/ missing).
                                  Applied to |I_metal - I_clean|; at 2500 HU this isolates
                                  the implant itself, not the surrounding bloom artifacts.
+            feature_cols     : list of feature column names to use as y vector.
+                               Defaults to FEATURE_COLS (all 7 available features).
             preload          : if True, all .raw files are loaded into RAM at init.
                                Fast for small datasets; skip for large ones (>50 GB).
         """
         self.p_random_metal      = p_random_metal
         self.metal_threshold_hu  = metal_threshold_hu
+        self.feature_cols        = list(feature_cols) if feature_cols else FEATURE_COLS
         self._cache: Optional[dict] = {} if preload else None
 
         # Build per-variant lookup: {body_name: {img_id: (art_path, clean_path, metal_path)}}
@@ -235,7 +239,7 @@ class GaussianDataset(Dataset):
                 metal_path = metal_dir / f'training_body_metalonly_img{img_id}_512x512x1.raw'
                 metal_path = metal_path if metal_path.exists() else None
 
-                row = body_feats.loc[img_id, FEATURE_COLS].values.astype(np.float32)
+                row = body_feats.loc[img_id, self.feature_cols].values.astype(np.float32)
 
                 self._records.append({
                     'art_path':   art_path,
@@ -250,7 +254,8 @@ class GaussianDataset(Dataset):
                 "GaussianDataset is empty. Check body_dirs and features_df."
             )
         logger.info(f"GaussianDataset: {len(self._records)} samples from "
-                    f"{len(body_dirs)} body dir(s)")
+                    f"{len(body_dirs)} body dir(s), y_dim={len(self.feature_cols)}")
+        logger.info(f"  feature_cols: {self.feature_cols}")
 
     def __len__(self) -> int:
         return len(self._records)
