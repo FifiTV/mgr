@@ -4,15 +4,16 @@ Model architectures for metal artifact reduction.
 
 from .cyclegan import Generator, Discriminator, ResidualBlock, weights_init_normal
 from .diffusion import (
-    DiffusionModel, 
+    DiffusionModel,
     DiffusionArchitecture,
-    SinusoidalPositionEmbeddings, 
+    SinusoidalPositionEmbeddings,
     Block,
     ConditionalUnetLight,
     ConditionalUnetStandard,
     ResnetBlock,
     AttentionBlock
 )
+from .gaussian_unet import GaussianUNet, GaussianDDPM, SinusoidalEmbedding, ResNetBlock, SelfAttention
 
 __all__ = [
     "Generator",
@@ -27,4 +28,9 @@ __all__ = [
     "ConditionalUnetStandard",
     "ResnetBlock",
     "AttentionBlock",
+    "GaussianUNet",
+    "GaussianDDPM",
+    "SinusoidalEmbedding",
+    "ResNetBlock",
+    "SelfAttention",
 ]
