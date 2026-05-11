@@ -107,11 +107,12 @@ def generate_samples(ddpm: GaussianDDPM,
                      condition: torch.Tensor,
                      save_dir: str,
                      epoch: int,
-                     device: torch.device) -> None:
+                     device: torch.device,
+                     y_dim: int = 6) -> None:
     """
     Generate visual sanity-check samples using EMA weights for two fixed y_target:
-        y_low  = [0.2, 0.5, 0.5, 0.5, 0.5, 0.5]  -- low peak_amplitude
-        y_high = [0.8, 0.5, 0.5, 0.5, 0.5, 0.5]  -- high peak_amplitude
+        y_low  = [0.2, 0.5, ..., 0.5]  -- low peak_amplitude
+        y_high = [0.8, 0.5, ..., 0.5]  -- high peak_amplitude
 
     EMA weights are temporarily swapped in and restored after sampling.
     """
@@ -129,9 +130,10 @@ def generate_samples(ddpm: GaussianDDPM,
     B = min(condition.shape[0], 2)
     cond = condition[:B].to(device)
 
-    for label, y_vals in [('low',  [0.2, 0.5, 0.5, 0.5, 0.5, 0.5]),
-                           ('high', [0.8, 0.5, 0.5, 0.5, 0.5, 0.5])]:
-        y_target    = torch.tensor(y_vals, device=device).unsqueeze(0).expand(B, -1)
+    for label, amp in [('low', 0.2), ('high', 0.8)]:
+        y_vals      = [0.5] * y_dim
+        y_vals[0]   = amp  # peak_amplitude is always first feature
+        y_target    = torch.tensor(y_vals, dtype=torch.float32, device=device).unsqueeze(0).expand(B, -1)
         i_error_gen = ddpm.sample(cond, y_target)          # [B, 1, H, W]
 
         for i in range(B):
@@ -202,7 +204,8 @@ def train_gaussian(config: dict,
     base_ch             = gaus_cfg.get('base_channels', 64)
     t_emb_dim           = gaus_cfg.get('t_emb_dim', 256)
     attn_heads          = gaus_cfg.get('attn_heads', 8)
-    metal_threshold_hu  = config.get('data', {}).get('metal_threshold_hu', 2500.0)
+    metal_threshold_hu  = gaus_cfg.get('metal_threshold_hu',
+                              config.get('data', {}).get('metal_threshold_hu', 500.0))
     checkpoint_interval = config.get('training', {}).get('checkpoint_interval', 10)
     num_workers         = config.get('dataset', {}).get('num_workers', 2)
     sample_interval     = gaus_cfg.get('sample_interval', 1)
@@ -295,8 +298,11 @@ def train_gaussian(config: dict,
             if sample_condition is None:
                 sample_condition = condition.detach().cpu()
 
-            # Sample a single y_target for the whole batch (same vector for all B samples)
-            y_target = torch.rand(6, device=device).unsqueeze(0).expand(y_i.size(0), -1).contiguous()  # [B, 6]
+            # Sample y_target as a random row from the current batch's feature vectors.
+            # Using torch.rand would land in empty regions of feature space (U[0,1]^F
+            # has no samples near it), driving all Gaussian weights to ~0 and loss to 0.
+            rand_idx = torch.randint(y_i.size(0), (1,)).item()
+            y_target = y_i[rand_idx].unsqueeze(0).expand(y_i.size(0), -1).contiguous()  # [B, F]
 
             optimizer.zero_grad()
 
@@ -304,7 +310,7 @@ def train_gaussian(config: dict,
                 with torch.amp.autocast('cuda'):
                     eps, eps_pred = ddpm(i_error, condition, y_target)
                     loss, mean_wt = gaussian_vicinal_loss(
-                        eps, eps_pred, y_i, y_target[0], sigma
+                        eps, eps_pred, y_i, y_target, sigma
                     )
                 scaler.scale(loss).backward()
                 scaler.unscale_(optimizer)
@@ -372,7 +378,7 @@ def train_gaussian(config: dict,
         # ── Sample generation ─────────────────────────────────────────────────────
         if sample_interval > 0 and (epoch + 1) % sample_interval == 0:
             cond_batch = sample_condition.to(device)
-            generate_samples(ddpm, ema.state_dict(), cond_batch, sample_dir, epoch + 1, device)
+            generate_samples(ddpm, ema.state_dict(), cond_batch, sample_dir, epoch + 1, device, y_dim=y_dim)
 
     # ── Final weights ─────────────────────────────────────────────────────────────
     raw_path = os.path.join(output_dir, 'gaussian_unet.pth')
