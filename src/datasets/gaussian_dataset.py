@@ -33,6 +33,7 @@ from typing import List, Optional, Union
 import numpy as np
 import pandas as pd
 import torch
+from scipy.ndimage import binary_dilation, generate_binary_structure
 from torch.utils.data import Dataset
 
 logger = logging.getLogger(__name__)
@@ -56,8 +57,18 @@ def normalize_ct(x: np.ndarray, hu_min: float = -1000.0,
 
 
 def normalize_error(x: np.ndarray, clip: float = 3000.0) -> np.ndarray:
-    """Clip I_error to [-clip, clip] and scale to [-1, 1]."""
-    return np.clip(x, -clip, clip) / clip
+    """Percentile normalization of I_error.
+
+    Clips to [-clip, clip], then scales by the 99.5th percentile of the
+    absolute non-zero values. This avoids the /3000 bias where 98%+ of pixels
+    are near zero (background) and the artifact signal gets drowned out.
+    """
+    x = np.clip(x, -clip, clip)
+    nonzero = np.abs(x[x != 0])
+    if len(nonzero) == 0:
+        return x
+    scale = float(np.percentile(nonzero, 99.5)) + 1e-6
+    return np.clip(x / scale, -1.0, 1.0)
 
 
 # ── Feature CSV loading ──────────────────────────────────────────────────────────
@@ -172,7 +183,7 @@ class GaussianDataset(Dataset):
     Directory structure per body variant:
         <body_dir>/Baseline/  training_body_metalart_imgN_512x512x1.raw
         <body_dir>/Target/    training_body_nometal_imgN_512x512x1.raw
-        <body_dir>/Metal/     training_body_metalonly_imgN_512x512x1.raw  (optional)
+        <body_dir>/Metal/     training_body_metalonlymask_imgN_512x512x1.raw  (optional)
     """
 
     def __init__(self,
@@ -236,7 +247,7 @@ class GaussianDataset(Dataset):
                 if not clean_path.exists():
                     continue
 
-                metal_path = metal_dir / f'training_body_metalonly_img{img_id}_512x512x1.raw'
+                metal_path = metal_dir / f'training_body_metalonlymask_img{img_id}_512x512x1.raw'
                 metal_path = metal_path if metal_path.exists() else None
 
                 row = body_feats.loc[img_id, self.feature_cols].values.astype(np.float32)
@@ -267,23 +278,28 @@ class GaussianDataset(Dataset):
             return self._cache[path].copy()  # copy: normalization must not modify cache
         return np.fromfile(path, dtype=np.float32).reshape(SHAPE)
 
-    def _get_metal_mask(self, record: dict) -> np.ndarray:
-        """Load metal mask from Metal/ dir or compute from implant position.
+    _DILATE_STRUCT = generate_binary_structure(2, 2)  # 8-connected, shared across instances
 
-        Fallback threshold (metal_threshold_hu = 2500 HU) isolates the implant voxels
-        only -- bloom artifacts typically stay below 2040 HU (bloom_max) so they are
-        NOT included in this mask. That is the intended behaviour: M_metal encodes
-        implant position, not artifact extent.
+    def _get_metal_mask(self, record: dict) -> np.ndarray:
+        """Load metal mask and dilate to cover streak artifact zone.
+
+        Dilation (20 iterations, ~1.3 mm radius) extends the implant footprint
+        to include the immediate streak region, giving the model a spatial prior
+        for where artifacts occur.
+
+        If Metal/ files are absent, falls back to thresholding |I_art - I_clean|
+        at 500 HU (lower than the old 2500 HU, to catch the actual implant signal).
         """
         if record['metal_path'] is not None:
             mask = self._load_raw(record['metal_path'])
-            # Binary: some files store the mask as soft HU values
-            return (mask > 0.5).astype(np.float32)
+            binary = (mask > 0.5).astype(bool)
+        else:
+            i_art   = self._load_raw(record['art_path'])
+            i_clean = self._load_raw(record['clean_path'])
+            binary  = (np.abs(i_art - i_clean) > 500).astype(bool)
 
-        # Fallback: threshold on |I_metal - I_clean| to locate the implant
-        i_art   = self._load_raw(record['art_path'])
-        i_clean = self._load_raw(record['clean_path'])
-        return (np.abs(i_art - i_clean) > self.metal_threshold_hu).astype(np.float32)
+        dilated = binary_dilation(binary, structure=self._DILATE_STRUCT, iterations=20)
+        return dilated.astype(np.float32)
 
     def __getitem__(self, idx: int) -> dict:
         rec     = self._records[idx]
@@ -298,19 +314,8 @@ class GaussianDataset(Dataset):
 
         # Random metal swap augmentation
         if self.p_random_metal > 0.0 and np.random.rand() < self.p_random_metal:
-            swap_idx    = np.random.randint(len(self._records))
-            swap_rec    = self._records[swap_idx]
-            m_metal_src = swap_rec['metal_path']
-
-            if m_metal_src is not None:
-                m_metal = self._load_raw(m_metal_src)
-                m_metal = (m_metal > 0.5).astype(np.float32)
-            else:
-                # Fallback: compute swap mask from difference
-                i_art_swap   = self._load_raw(swap_rec['art_path'])
-                i_clean_swap = self._load_raw(swap_rec['clean_path'])
-                m_metal = (np.abs(i_art_swap - i_clean_swap) >
-                            self.metal_threshold_hu).astype(np.float32)
+            swap_idx = np.random.randint(len(self._records))
+            m_metal  = self._get_metal_mask(self._records[swap_idx])
 
         # Normalize
         i_clean_n = normalize_ct(i_clean)
