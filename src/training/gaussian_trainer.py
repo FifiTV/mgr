@@ -206,6 +206,7 @@ def train_gaussian(config: dict,
     attn_heads          = gaus_cfg.get('attn_heads', 8)
     metal_threshold_hu  = gaus_cfg.get('metal_threshold_hu',
                               config.get('data', {}).get('metal_threshold_hu', 500.0))
+    error_scale         = gaus_cfg.get('error_scale', 310.5)
     checkpoint_interval = config.get('training', {}).get('checkpoint_interval', 10)
     num_workers         = config.get('dataset', {}).get('num_workers', 2)
     sample_interval     = gaus_cfg.get('sample_interval', 1)
@@ -231,6 +232,7 @@ def train_gaussian(config: dict,
         features_df=features_df,
         p_random_metal=p_random_metal,
         metal_threshold_hu=metal_threshold_hu,
+        error_scale=error_scale,
         feature_cols=feature_cols,
     )
     dataloader = DataLoader(

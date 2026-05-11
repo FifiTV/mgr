@@ -41,7 +41,7 @@ logger = logging.getLogger(__name__)
 SHAPE       = (512, 512)
 FEATURE_COLS = [
     'peak_amplitude', 'spatial_extent', 'bbox_ratio',
-    'dark_to_bright_ratio', 'angular_concentration', 'texture_roughness', 'tau',
+    'dark_to_bright_ratio', 'angular_concentration', 'texture_roughness',
 ]
 LOG_FEATURES = {'peak_amplitude', 'angular_concentration'}
 METAL_THRESHOLD_HU = 2500.0  # fallback metal mask threshold
@@ -56,19 +56,24 @@ def normalize_ct(x: np.ndarray, hu_min: float = -1000.0,
     return (x - hu_min) / (hu_max - hu_min) * 2.0 - 1.0
 
 
-def normalize_error(x: np.ndarray, clip: float = 3000.0) -> np.ndarray:
-    """Percentile normalization of I_error.
+def normalize_error(x: np.ndarray, clip: float = 3000.0,
+                    scale: float = 310.5) -> np.ndarray:
+    """Normalize I_error using a global dataset-wide scale.
 
-    Clips to [-clip, clip], then scales by the 99.5th percentile of the
-    absolute non-zero values. This avoids the /3000 bias where 98%+ of pixels
-    are near zero (background) and the artifact signal gets drowned out.
+    Clips to [-clip, clip], then divides by `scale` (global P50 of per-image
+    P99.5 computed on the full training set). Values beyond ±scale are clipped
+    to ±1. This preserves relative amplitude across samples: a weak artifact
+    stays near 0 while a strong one saturates toward ±1, giving the model a
+    consistent signal to learn peak_amplitude conditioning.
+
+    Args:
+        clip  : hard HU clip before scaling (removes scanner outliers).
+        scale : dataset-wide divisor in HU. Default 310.5 is the P50 of
+                per-image P99.5 computed on the full RPI training set.
+                Override via GaussianDataset(error_scale=...) or config.toml
+                [gaussian] error_scale.
     """
-    x = np.clip(x, -clip, clip)
-    nonzero = np.abs(x[x != 0])
-    if len(nonzero) == 0:
-        return x
-    scale = float(np.percentile(nonzero, 99.5)) + 1e-6
-    return np.clip(x / scale, -1.0, 1.0)
+    return np.clip(x, -clip, clip) / scale
 
 
 # ── Feature CSV loading ──────────────────────────────────────────────────────────
@@ -191,6 +196,7 @@ class GaussianDataset(Dataset):
                  features_df: pd.DataFrame,
                  p_random_metal: float = 0.5,
                  metal_threshold_hu: float = METAL_THRESHOLD_HU,
+                 error_scale: float = 310.5,
                  preload: bool = False,
                  feature_cols: Optional[List[str]] = None):
         """
@@ -208,6 +214,7 @@ class GaussianDataset(Dataset):
         """
         self.p_random_metal      = p_random_metal
         self.metal_threshold_hu  = metal_threshold_hu
+        self.error_scale         = error_scale
         self.feature_cols        = list(feature_cols) if feature_cols else FEATURE_COLS
         self._cache: Optional[dict] = {} if preload else None
 
@@ -296,7 +303,7 @@ class GaussianDataset(Dataset):
         else:
             i_art   = self._load_raw(record['art_path'])
             i_clean = self._load_raw(record['clean_path'])
-            binary  = (np.abs(i_art - i_clean) > 500).astype(bool)
+            binary  = (np.abs(i_art - i_clean) > self.metal_threshold_hu).astype(bool)
 
         dilated = binary_dilation(binary, structure=self._DILATE_STRUCT, iterations=20)
         return dilated.astype(np.float32)
@@ -319,7 +326,7 @@ class GaussianDataset(Dataset):
 
         # Normalize
         i_clean_n = normalize_ct(i_clean)
-        i_error_n = normalize_error(i_error)
+        i_error_n = normalize_error(i_error, scale=self.error_scale)
 
         return {
             'i_clean': torch.from_numpy(i_clean_n[None]).float(),  # [1, H, W]
