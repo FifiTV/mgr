@@ -84,6 +84,30 @@ tanh_scale = 80.0
 
 baseline_metalart_max = 81265.640625
 bloom_max = 2040.6845703125
+[gaussian]
+# Gaussian Vicinal DDPM parameters
+enabled         = true
+T               = 1000
+beta_schedule   = "linear"   # "linear" or "cosine"
+beta_start      = 1e-4
+beta_end        = 0.02
+batch_size      = 4          # 512x512 images are large -- tune to VRAM
+n_epochs        = 100
+learning_rate   = 2e-4
+sigma_max       = 0.3        # starting neighborhood bandwidth
+sigma_min       = 0.02       # final bandwidth (cosine annealing)
+p_random_metal  = 0.5        # probability of random metal mask swap
+ema_decay       = 0.9999
+base_channels   = 64
+t_emb_dim       = 256
+attn_heads      = 8
+sample_interval      = 1     # generate visual samples every N epochs (0 = disabled)
+metal_threshold_hu   = 500   # fallback mask threshold when Metal/ dir is absent; 500 HU catches implant bloom
+error_scale          = 318.8 # global P50 of per-image P99.5 of |I_error|, computed on full RPI training set (12374 images)
+feature_cols    = ["peak_amplitude", "spatial_extent", "bbox_ratio",
+                   "dark_to_bright_ratio", "angular_concentration",
+                   "texture_roughness"]  # add "tau" to include it
+
 [preprocessing]
 # Normalization for CT images
 normalize_hu = true
