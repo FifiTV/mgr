@@ -55,24 +55,20 @@ def normalize_ct(x: np.ndarray, hu_min: float = -1000.0,
     return (x - hu_min) / (hu_max - hu_min) * 2.0 - 1.0
 
 
-def normalize_error(x: np.ndarray, clip: float = 3000.0,
-                    scale: float = 310.5) -> np.ndarray:
-    """Normalize I_error using a global dataset-wide scale.
+def normalize_error(x: np.ndarray, scale: float = 642.8) -> np.ndarray:
+    """Normalize I_error to exactly [-1, 1] using symmetric clip-and-scale.
 
-    Clips to [-clip, clip], then divides by `scale` (global P50 of per-image
-    P99.5 computed on the full training set). Values beyond ±scale are clipped
-    to ±1. This preserves relative amplitude across samples: a weak artifact
-    stays near 0 while a strong one saturates toward ±1, giving the model a
-    consistent signal to learn peak_amplitude conditioning.
+    Clips to [-scale, scale] then divides by scale. Output is guaranteed
+    in [-1, 1] with no secondary clip needed. Weak artifacts land near 0,
+    strong ones saturate at ±1, preserving relative amplitude for
+    peak_amplitude conditioning.
 
-    Args:
-        clip  : hard HU clip before scaling (removes scanner outliers).
-        scale : dataset-wide divisor in HU. Default 310.5 is the P50 of
-                per-image P99.5 computed on the full RPI training set.
-                Override via GaussianDataset(error_scale=...) or config.toml
-                [gaussian] error_scale.
+    scale = 642.8 is the P75 of per-image P99.5 across the full RPI
+    training set (12374 images). P75 chosen over P50 (310.5) to reduce
+    saturation: at P50 ~50% of images clip at ±1, at P75 only ~25% do.
+    Override via GaussianDataset(error_scale=...) or config.toml [gaussian] error_scale.
     """
-    return np.clip(x, -clip, clip) / scale
+    return np.clip(x, -scale, scale) / scale
 
 
 # ── Feature CSV loading ──────────────────────────────────────────────────────────
@@ -195,7 +191,7 @@ class GaussianDataset(Dataset):
                  features_df: pd.DataFrame,
                  p_random_metal: float = 0.5,
                  metal_threshold_hu: float = METAL_THRESHOLD_HU,
-                 error_scale: float = 310.5,
+                 error_scale: float = 642.8,
                  preload: bool = False,
                  feature_cols: Optional[List[str]] = None):
         """
