@@ -33,7 +33,6 @@ from typing import List, Optional, Union
 import numpy as np
 import pandas as pd
 import torch
-from scipy.ndimage import binary_dilation, generate_binary_structure
 from torch.utils.data import Dataset
 
 logger = logging.getLogger(__name__)
@@ -285,28 +284,22 @@ class GaussianDataset(Dataset):
             return self._cache[path].copy()  # copy: normalization must not modify cache
         return np.fromfile(path, dtype=np.float32).reshape(SHAPE)
 
-    _DILATE_STRUCT = generate_binary_structure(2, 2)  # 8-connected, shared across instances
-
     def _get_metal_mask(self, record: dict) -> np.ndarray:
-        """Load metal mask and dilate to cover streak artifact zone.
+        """Return binary metal mask exactly as stored in Metal/ files (no dilation).
 
-        Dilation (20 iterations, ~1.3 mm radius) extends the implant footprint
-        to include the immediate streak region, giving the model a spatial prior
-        for where artifacts occur.
+        The model learns streak locations from I_error during training.
+        The mask only needs to mark the implant source, not its artifact extent.
 
-        If Metal/ files are absent, falls back to thresholding |I_art - I_clean|
-        at 500 HU (lower than the old 2500 HU, to catch the actual implant signal).
+        Fallback (Metal/ absent): threshold |I_art - I_clean| at 2500 HU,
+        which isolates the implant itself (above bloom range ~2040 HU).
         """
         if record['metal_path'] is not None:
             mask = self._load_raw(record['metal_path'])
-            binary = (mask > 0.5).astype(bool)
-        else:
-            i_art   = self._load_raw(record['art_path'])
-            i_clean = self._load_raw(record['clean_path'])
-            binary  = (np.abs(i_art - i_clean) > self.metal_threshold_hu).astype(bool)
+            return (mask > 0.5).astype(np.float32)
 
-        dilated = binary_dilation(binary, structure=self._DILATE_STRUCT, iterations=20)
-        return dilated.astype(np.float32)
+        i_art   = self._load_raw(record['art_path'])
+        i_clean = self._load_raw(record['clean_path'])
+        return (np.abs(i_art - i_clean) > self.metal_threshold_hu).astype(np.float32)
 
     def __getitem__(self, idx: int) -> dict:
         rec     = self._records[idx]
