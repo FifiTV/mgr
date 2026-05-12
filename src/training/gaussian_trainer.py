@@ -271,11 +271,11 @@ def train_gaussian(config: dict,
     scaler    = torch.amp.GradScaler('cuda') if device.type == 'cuda' else None
     ema       = EMA(unet, decay=ema_decay)
 
-    history = {'loss': [], 'sigma': [], 'mean_weight': []}
+    history = {'loss': [], 'sigma': [], 'mean_weight': [], 'avg_dist': []}
 
     hist_csv_path = os.path.join(output_dir, 'gaussian_history.csv')
     with open(hist_csv_path, 'w', newline='') as _f:
-        csv.writer(_f).writerow(['epoch', 'loss', 'sigma', 'mean_weight', 'lr'])
+        csv.writer(_f).writerow(['epoch', 'loss', 'sigma', 'mean_weight', 'avg_dist', 'lr'])
     logger.info(f"Metrics CSV: {hist_csv_path}")
 
     # Fixed condition batch for sample generation (grabbed on first batch)
@@ -286,6 +286,7 @@ def train_gaussian(config: dict,
         sigma   = sigma_schedule(epoch, n_epochs, sigma_max, sigma_min)
         ep_loss = 0.0
         ep_wt   = 0.0
+        ep_dist = 0.0
         ddpm.train()
 
         for batch_idx, batch in enumerate(dataloader):
@@ -305,6 +306,25 @@ def train_gaussian(config: dict,
             # has no samples near it), driving all Gaussian weights to ~0 and loss to 0.
             rand_idx = torch.randint(y_i.size(0), (1,)).item()
             y_target = y_i[rand_idx].unsqueeze(0).expand(y_i.size(0), -1).contiguous()  # [B, F]
+
+            # ── Diagnostic log (first batch of each epoch) ────────────────────────
+            if batch_idx == 0:
+                with torch.no_grad():
+                    yi_mean = y_i.mean(dim=0).cpu().numpy().round(3)
+                    yi_std  = y_i.std(dim=0).cpu().numpy().round(3)
+                    dist    = (y_target - y_i).pow(2).sum(dim=1).sqrt()
+                    dist_mean = dist.mean().item()
+                    logger.info(
+                        f"  [DIAG E{epoch+1}] y_i mean={yi_mean}  std={yi_std}"
+                    )
+                    logger.info(
+                        f"  [DIAG E{epoch+1}] dist(y_target→y_i): mean={dist_mean:.4f}"
+                        f"  min={dist.min().item():.4f}  max={dist.max().item():.4f}"
+                    )
+                    logger.info(
+                        f"  [DIAG E{epoch+1}] i_error: min={i_error.min():.4f}"
+                        f"  max={i_error.max():.4f}  mean={i_error.mean():.5f}"
+                    )
 
             optimizer.zero_grad()
 
@@ -331,6 +351,8 @@ def train_gaussian(config: dict,
             ema.update(unet)
             ep_loss += loss.item()
             ep_wt   += mean_wt
+            with torch.no_grad():
+                ep_dist += (y_target - y_i).pow(2).sum(dim=1).sqrt().mean().item()
 
             if (batch_idx + 1) % 10 == 0:
                 logger.info(
@@ -345,20 +367,24 @@ def train_gaussian(config: dict,
 
         avg_loss = ep_loss / max(len(dataloader), 1)
         avg_wt   = ep_wt   / max(len(dataloader), 1)
+        avg_dist = ep_dist / max(len(dataloader), 1)
         history['loss'].append(avg_loss)
         history['sigma'].append(sigma)
         history['mean_weight'].append(avg_wt)
+        history['avg_dist'].append(avg_dist)
 
         current_lr = optimizer.param_groups[0]['lr']
+        wt_warn = '  *** mean_weight HIGH — sigma too large or features clustered? ***' if avg_wt > 0.3 else ''
         logger.info(
             f"[Epoch {epoch+1}/{n_epochs}] avg_loss={avg_loss:.5f}"
             f"  sigma={sigma:.4f}  mean_weight={avg_wt:.4f}"
-            f"  lr={current_lr:.2e}"
+            f"  avg_dist={avg_dist:.4f}  lr={current_lr:.2e}{wt_warn}"
         )
 
         with open(hist_csv_path, 'a', newline='') as _f:
             csv.writer(_f).writerow(
-                [epoch + 1, f'{avg_loss:.6f}', f'{sigma:.6f}', f'{avg_wt:.6f}', f'{current_lr:.2e}']
+                [epoch + 1, f'{avg_loss:.6f}', f'{sigma:.6f}',
+                 f'{avg_wt:.6f}', f'{avg_dist:.6f}', f'{current_lr:.2e}']
             )
 
         # ── Checkpoint ────────────────────────────────────────────────────────────
