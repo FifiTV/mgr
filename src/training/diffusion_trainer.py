@@ -71,19 +71,19 @@ def train_diffusion(dataloader_soft: DataLoader, dataloader_hard: DataLoader,
     logger.info(f"Epochs: {epochs}  LR: {lr}  EMA decay: {ema_decay}  Warmup: {warmup}")
     logger.info(f"Mask dropout probability: {mask_dropout}")
 
-    # Single model shared across both modes (HARD continues from SOFT weights)
-    diffusion = DiffusionModel(
-        architecture=architecture,
-        time_steps=1000,
-        device=device,
-        input_channels=config['models']['unet_input_channels'],
-        output_channels=config['models']['unet_output_channels'],
-    )
-
     for mode_name, dataloader in [("SOFT", dataloader_soft), ("HARD", dataloader_hard)]:
         logger.info(f"\n{'='*40}")
         logger.info(f"Training {mode_name} Labels Diffusion Model  ({epochs} epochs)")
         logger.info(f"{'='*40}")
+
+        # Fresh model for each mode — SOFT and HARD are independent experiments
+        diffusion = DiffusionModel(
+            architecture=architecture,
+            time_steps=1000,
+            device=device,
+            input_channels=config['models']['unet_input_channels'],
+            output_channels=config['models']['unet_output_channels'],
+        )
 
         optimizer = optim.Adam(diffusion.parameters(), lr=lr)
         scheduler = CosineAnnealingLR(optimizer, T_max=epochs, eta_min=lr * 0.1)
@@ -102,9 +102,6 @@ def train_diffusion(dataloader_soft: DataLoader, dataloader_hard: DataLoader,
                 real_B = batch['real_B'].to(device)
                 mask_M = batch['mask_M'].to(device)
                 mask_A = batch['mask_A'].to(device)
-
-                if mode_name == "HARD":
-                    mask_A = (mask_A > 0.2).float()
 
                 # Mask dropout: zero out masks for the whole batch with probability
                 # mask_dropout_prob. This teaches the model to generate artifacts
@@ -135,6 +132,7 @@ def train_diffusion(dataloader_soft: DataLoader, dataloader_hard: DataLoader,
                     optimizer.step()
 
                 ema.update(diffusion.model)
+                epoch_loss += loss.item()
                 total_steps += 1
 
                 if (batch_idx + 1) % 10 == 0:
