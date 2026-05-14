@@ -362,6 +362,16 @@ def train_cyclegan(
                             f"[D: {(loss_D_A.item() + loss_D_B.item()):.4f}]"
                         )
 
+            # Save "latest" checkpoint every epoch (overwrites previous)
+            latest_dir = os.path.join(
+                output_dir, 'checkpoints', 'cyclegan', label_mode.lower(), 'latest'
+            )
+            os.makedirs(latest_dir, exist_ok=True)
+            torch.save(G_AB.state_dict(), os.path.join(latest_dir, 'G_AB.pth'))
+            torch.save(G_BA.state_dict(), os.path.join(latest_dir, 'G_BA.pth'))
+            torch.save(D_A.state_dict(),  os.path.join(latest_dir, 'D_A.pth'))
+            torch.save(D_B.state_dict(),  os.path.join(latest_dir, 'D_B.pth'))
+
             # Save sample images every epoch (both SOFT and HARD)
             save_cyclegan_samples(
                 epoch=epoch + 1,

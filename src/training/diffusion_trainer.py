@@ -12,9 +12,45 @@ from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import DataLoader
 
 from src.models.diffusion import DiffusionModel, DiffusionArchitecture
+from src.utils.visualization import save_diffusion_samples
 
 
 logger = logging.getLogger(__name__)
+
+
+@torch.no_grad()
+def _ddpm_sample(diffusion: DiffusionModel, condition: torch.Tensor,
+                 n_steps: int = 100) -> torch.Tensor:
+    """DDPM reverse process with uniformly subsampled timesteps.
+
+    Uses n_steps << T for fast per-epoch visualization.
+    Quality is lower than full sampling but sufficient for progress monitoring.
+    """
+    T = diffusion.time_steps
+    stride = max(1, T // n_steps)
+    timesteps = list(range(0, T, stride))[::-1]
+
+    device = condition.device
+    B, _, H, W = condition.shape[0], None, condition.shape[2], condition.shape[3]
+    x = torch.randn(condition.shape[0], 1, H, W, device=device)
+
+    diffusion.eval()
+    for t_val in timesteps:
+        t = torch.full((condition.shape[0],), t_val, dtype=torch.long, device=device)
+        noise_pred = diffusion.model(torch.cat((x, condition), dim=1), t)
+
+        alpha_t     = diffusion.alphas[t_val]
+        alpha_bar_t = diffusion.alphas_cumprod[t_val]
+        beta_t      = diffusion.betas[t_val]
+
+        x = (1.0 / alpha_t.sqrt()) * (
+            x - beta_t / (1.0 - alpha_bar_t).sqrt() * noise_pred
+        )
+        if t_val > 0:
+            x = x + beta_t.sqrt() * torch.randn_like(x)
+
+    diffusion.train()
+    return x.clamp(-1.0, 1.0)
 
 
 class EMA:
@@ -66,6 +102,7 @@ def train_diffusion(dataloader_soft: DataLoader, dataloader_hard: DataLoader,
     architecture        = diff_cfg.get('architecture', 'light')
     mask_dropout        = diff_cfg.get('mask_dropout_prob', 0.0)
     checkpoint_interval = config['training'].get('checkpoint_interval', 10)
+    sample_dir          = config.get('paths', {}).get('sample_dir', 'results/samples')
 
     logger.info(f"Architecture: {architecture.upper()}")
     logger.info(f"Epochs: {epochs}  LR: {lr}  EMA decay: {ema_decay}  Warmup: {warmup}")
@@ -92,6 +129,7 @@ def train_diffusion(dataloader_soft: DataLoader, dataloader_hard: DataLoader,
 
         history = {'loss': []}
         total_steps = 0
+        _last_real_A = _last_real_B = _last_mask_M = _last_mask_A = _last_cond = None
 
         for epoch in range(epochs):
             epoch_loss = 0.0
@@ -135,6 +173,13 @@ def train_diffusion(dataloader_soft: DataLoader, dataloader_hard: DataLoader,
                 epoch_loss += loss.item()
                 total_steps += 1
 
+                # Keep last batch tensors for end-of-epoch visualization
+                _last_real_A = real_A.detach()
+                _last_real_B = real_B.detach()
+                _last_mask_M = mask_M.detach()
+                _last_mask_A = mask_A.detach()
+                _last_cond   = condition.detach()
+
                 if (batch_idx + 1) % 10 == 0:
                     logger.info(
                         f"[{mode_name}][Epoch {epoch+1}/{epochs}]"
@@ -155,7 +200,29 @@ def train_diffusion(dataloader_soft: DataLoader, dataloader_hard: DataLoader,
                 f"  lr={optimizer.param_groups[0]['lr']:.2e}"
             )
 
-            # Save checkpoint every checkpoint_interval epochs (0 = disabled)
+            # Generate samples and save (every epoch, overwrite "latest")
+            if _last_cond is not None:
+                fake_B_sample = _ddpm_sample(diffusion, _last_cond[:4], n_steps=100)
+                save_diffusion_samples(
+                    epoch=epoch + 1,
+                    label_mode=mode_name,
+                    real_A=_last_real_A[:4],
+                    real_B=_last_real_B[:4],
+                    fake_B=fake_B_sample,
+                    mask_M=_last_mask_M[:4],
+                    mask_A=_last_mask_A[:4],
+                    save_dir=sample_dir,
+                )
+
+            # Save "latest" checkpoint every epoch (overwrites previous)
+            latest_dir = os.path.join(
+                output_dir, 'checkpoints', 'diffusion', mode_name.lower(), 'latest'
+            )
+            os.makedirs(latest_dir, exist_ok=True)
+            torch.save(diffusion.model.state_dict(), os.path.join(latest_dir, 'model.pth'))
+            torch.save(ema.state_dict(),             os.path.join(latest_dir, 'model_ema.pth'))
+
+            # Save periodic checkpoint every checkpoint_interval epochs (0 = disabled)
             if checkpoint_interval > 0 and (epoch + 1) % checkpoint_interval == 0:
                 ckpt_dir = os.path.join(
                     output_dir, 'checkpoints', 'diffusion',
