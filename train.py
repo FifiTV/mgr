@@ -5,9 +5,12 @@ Train CycleGAN, Diffusion, and Gaussian Vicinal DDPM models.
 
 Usage:
     python train.py --type cycle --epochs 5
-    python train.py --type diff --epochs 50
-    python train.py --type gaussian
+    python train.py --type diff  --epochs 50
     python train.py --type gaussian --features-dir results --data-path data/raw/RPI
+
+    # Custom output locations (checkpoints + samples):
+    python train.py --type cycle --output-dir runs/exp1 --sample-dir runs/exp1/samples
+    python train.py --type diff  --output-dir runs/exp1 --sample-dir runs/exp1/samples
 """
 
 import argparse
@@ -89,15 +92,22 @@ def main():
         '--output-dir',
         type=str,
         default=None,
-        help='Output directory for checkpoints, samples, and history. '
-             'Defaults to results/models/gaussian.'
+        help='Directory for checkpoints and history. '
+             'Overrides config for all model types.'
+    )
+    parser.add_argument(
+        '--sample-dir',
+        type=str,
+        default=None,
+        help='Directory for generated sample images saved each epoch. '
+             'Overrides config paths.sample_dir.'
     )
 
     args = parser.parse_args()
-    
+
     # Load config
     config = load_config(args.config)
-    
+
     # Override config with command line arguments
     if args.epochs:
         config['cyclegan']['n_epochs'] = args.epochs
@@ -111,8 +121,19 @@ def main():
             f.strip() for f in args.features.split(',')
         ]
 
+    # Resolve output paths: CLI > config > hardcoded fallback
+    paths_cfg  = config.get('paths', {})
+    output_dir = args.output_dir or config['training']['model_save_dir']
+    sample_dir = args.sample_dir or paths_cfg.get('sample_dir', 'results/samples')
+
+    # Inject resolved paths back into config so trainers pick them up
+    config['training']['model_save_dir'] = output_dir
+    config.setdefault('paths', {})['sample_dir'] = sample_dir
+
+    logger.info(f"Output dir:  {output_dir}")
+    logger.info(f"Sample dir:  {sample_dir}")
+
     # Resolve data paths: CLI > config [paths] > hardcoded fallback
-    paths_cfg = config.get('paths', {})
     data_path = args.data_path or paths_cfg.get('raw_data_path', 'data/raw')
     real_path = paths_cfg.get('real_path') or None
     rpi_path  = paths_cfg.get('rpi_path')  or None
@@ -168,7 +189,7 @@ def main():
             train_cyclegan(
                 config=config,
                 device=device,
-                output_dir=config['training']['model_save_dir'],
+                output_dir=output_dir,
                 gen_data_source='rpi',
                 disc_data_source='both',
                 val_data_source='both',
@@ -206,12 +227,11 @@ def main():
             train_diffusion(
                 dataloader_soft, dataloader_hard,
                 config, device,
-                config['training']['model_save_dir'],
+                output_dir,
             )
         
         elif args.type == 'gaussian':
-            paths_cfg  = config.get('paths', {})
-            rpi_base   = rpi_path or data_path
+            rpi_base = rpi_path or data_path
 
             # Resolve body dirs for training split
             train_variants = rpi_train_variants or ['body1']
@@ -221,22 +241,33 @@ def main():
             logger.info(f"Gaussian — body dirs: {body_dirs}")
 
             # Features: --features-dir > sibling 'results/' of config > results/
+            # Accepts either a directory (with body*/features.csv) or a direct CSV path.
             config_dir    = os.path.dirname(os.path.abspath(args.config))
-            features_dir  = args.features_dir or os.path.join(config_dir, 'results')
-            clip_stats    = os.path.join(features_dir, 'feature_clip_stats.json')
-            clip_stats    = clip_stats if os.path.exists(clip_stats) else None
-            logger.info(f"Gaussian — features_dir: {features_dir}")
+            features_arg  = args.features_dir or os.path.join(config_dir, 'results')
+
+            # If given a directory, prefer features_norm.csv, then features.csv at top level.
+            if os.path.isdir(features_arg):
+                for candidate in ('features_norm.csv', 'features.csv'):
+                    candidate_path = os.path.join(features_arg, candidate)
+                    if os.path.exists(candidate_path):
+                        features_source = candidate_path
+                        logger.info(f"Gaussian — features file: {features_source}")
+                        break
+                else:
+                    features_source = features_arg  # fall back to dir (body*/features.csv)
+                    logger.info(f"Gaussian — features dir:  {features_source}")
+            else:
+                features_source = features_arg      # explicit file path passed directly
+                logger.info(f"Gaussian — features file: {features_source}")
+
+            clip_stats_dir = features_arg if os.path.isdir(features_arg) else os.path.dirname(features_arg)
+            clip_stats     = os.path.join(clip_stats_dir, 'feature_clip_stats.json')
+            clip_stats     = clip_stats if os.path.exists(clip_stats) else None
             if clip_stats:
                 logger.info(f"Gaussian — clip_stats:   {clip_stats}")
             else:
-                logger.warning("feature_clip_stats.json not found — features must be pre-normalized")
+                logger.info("feature_clip_stats.json not found — assuming features are pre-normalized")
 
-            if args.output_dir:
-                output_dir = args.output_dir
-            else:
-                output_dir = os.path.join(
-                    paths_cfg.get('results_dir', 'results'), 'models', 'gaussian'
-                )
             logger.info(f"Gaussian — output_dir: {output_dir}")
 
             train_gaussian(
@@ -244,7 +275,7 @@ def main():
                 device=device,
                 output_dir=output_dir,
                 body_dirs=body_dirs,
-                features_source=features_dir,
+                features_source=features_source,
                 clip_stats_path=clip_stats,
             )
 
