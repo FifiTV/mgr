@@ -2,7 +2,6 @@
 Diffusion Model training module.
 """
 
-import copy
 import logging
 import os
 import json
