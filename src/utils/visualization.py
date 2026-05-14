@@ -162,12 +162,13 @@ def save_cyclegan_samples(epoch: int,
                           fake_B: torch.Tensor,
                           mask_M: torch.Tensor,
                           mask_A: torch.Tensor,
-                          save_dir: str) -> None:
+                          save_dir: str,
+                          n_samples: int = 4) -> None:
     """
-    Save a training-progress image grid for one epoch.
+    Save training-progress image grids for one epoch.
 
-    Layout (first sample from batch):
-        Input (clean) | Metal Mask | Artifact Mask (soft) | Generated | Ground Truth
+    Saves up to n_samples PNGs from the batch, each with layout:
+        Input (clean) | Metal Mask | Artifact Mask | Generated | Ground Truth
 
     Args:
         epoch:      Current epoch number (1-based).
@@ -178,44 +179,116 @@ def save_cyclegan_samples(epoch: int,
         mask_M:     Metal mask       (B, 1, H, W), range [0, 1].
         mask_A:     Artifact mask    (B, 1, H, W), range [0, 1].
         save_dir:   Directory where PNGs are written.
+        n_samples:  How many samples from the batch to save (default: 4).
     """
     os.makedirs(save_dir, exist_ok=True)
 
-    # Take first sample from the batch, detach and move to CPU
-    def to_np(t: torch.Tensor) -> np.ndarray:
-        return t[0].squeeze().cpu().detach().float().numpy()
+    batch_size = real_A.shape[0]
+    n = min(n_samples, batch_size)
 
-    clean     = to_np(real_A)
-    ground_gt = to_np(real_B)
-    generated = to_np(fake_B)
-    metal     = to_np(mask_M)
-    artifact  = to_np(mask_A)
+    def to_np(t: torch.Tensor, i: int) -> np.ndarray:
+        return t[i].squeeze().cpu().detach().float().numpy()
 
-    fig, axes = plt.subplots(1, 5, figsize=(20, 4))
-    fig.suptitle(f"Epoch {epoch} — {label_mode} labels", fontsize=13, fontweight='bold')
+    for i in range(n):
+        fig, axes = plt.subplots(1, 5, figsize=(20, 4))
+        fig.suptitle(
+            f"Epoch {epoch} | {label_mode} | sample {i+1}/{n}",
+            fontsize=13, fontweight='bold'
+        )
 
-    axes[0].imshow(clean,     cmap='gray', vmin=-1, vmax=1)
-    axes[0].set_title('Input (clean)',     fontweight='bold')
-    axes[0].axis('off')
+        axes[0].imshow(to_np(real_A, i), cmap='gray', vmin=-1, vmax=1)
+        axes[0].set_title('Input (clean)',  fontweight='bold')
+        axes[0].axis('off')
 
-    axes[1].imshow(metal,     cmap='Reds', vmin=0, vmax=1)
-    axes[1].set_title('Metal mask',        fontweight='bold')
-    axes[1].axis('off')
+        axes[1].imshow(to_np(mask_M, i),  cmap='Reds', vmin=0, vmax=1)
+        axes[1].set_title('Metal mask',    fontweight='bold')
+        axes[1].axis('off')
 
-    axes[2].imshow(artifact,  cmap='hot',  vmin=0, vmax=1)
-    axes[2].set_title('Artifact mask',     fontweight='bold')
-    axes[2].axis('off')
+        axes[2].imshow(to_np(mask_A, i),  cmap='hot',  vmin=0, vmax=1)
+        axes[2].set_title('Artifact mask', fontweight='bold')
+        axes[2].axis('off')
 
-    axes[3].imshow(generated, cmap='gray', vmin=-1, vmax=1)
-    axes[3].set_title('Generated',         fontweight='bold')
-    axes[3].axis('off')
+        axes[3].imshow(to_np(fake_B, i),  cmap='gray', vmin=-1, vmax=1)
+        axes[3].set_title('Generated',     fontweight='bold')
+        axes[3].axis('off')
 
-    axes[4].imshow(ground_gt, cmap='gray', vmin=-1, vmax=1)
-    axes[4].set_title('Ground truth',      fontweight='bold')
-    axes[4].axis('off')
+        axes[4].imshow(to_np(real_B, i),  cmap='gray', vmin=-1, vmax=1)
+        axes[4].set_title('Ground truth',  fontweight='bold')
+        axes[4].axis('off')
 
-    plt.tight_layout()
+        plt.tight_layout()
+        fname = os.path.join(
+            save_dir,
+            f"sample_{label_mode.lower()}_epoch{epoch:04d}_s{i:02d}.png"
+        )
+        plt.savefig(fname, dpi=130, bbox_inches='tight')
+        plt.close(fig)
 
-    fname = os.path.join(save_dir, f"sample_{label_mode.lower()}_epoch{epoch:04d}.png")
-    plt.savefig(fname, dpi=130, bbox_inches='tight')
-    plt.close(fig)
+
+def save_diffusion_samples(epoch: int,
+                           label_mode: str,
+                           real_A: torch.Tensor,
+                           real_B: torch.Tensor,
+                           fake_B: torch.Tensor,
+                           mask_M: torch.Tensor,
+                           mask_A: torch.Tensor,
+                           save_dir: str,
+                           n_samples: int = 4) -> None:
+    """
+    Save diffusion training-progress image grids for one epoch.
+
+    Layout per sample:
+        Input (clean) | Metal mask | Artifact mask | Generated | Ground truth
+
+    Args:
+        epoch:      Current epoch number (1-based).
+        label_mode: "SOFT" or "HARD" — used in filename.
+        real_A:     Clean CT images      (B, 1, H, W), range [-1, 1].
+        real_B:     Artifact images      (B, 1, H, W), range [-1, 1].
+        fake_B:     Diffusion samples    (B, 1, H, W), range [-1, 1].
+        mask_M:     Metal mask           (B, 1, H, W), range [0, 1].
+        mask_A:     Artifact mask        (B, 1, H, W), range [0, 1].
+        save_dir:   Directory where PNGs are written.
+        n_samples:  How many samples from the batch to save (default: 4).
+    """
+    os.makedirs(save_dir, exist_ok=True)
+
+    n = min(n_samples, real_A.shape[0])
+
+    def to_np(t: torch.Tensor, i: int) -> np.ndarray:
+        return t[i].squeeze().cpu().detach().float().numpy()
+
+    for i in range(n):
+        fig, axes = plt.subplots(1, 5, figsize=(20, 4))
+        fig.suptitle(
+            f"Diffusion | Epoch {epoch} | {label_mode} | sample {i+1}/{n}",
+            fontsize=13, fontweight='bold'
+        )
+
+        axes[0].imshow(to_np(real_A, i), cmap='gray', vmin=-1, vmax=1)
+        axes[0].set_title('Input (clean)',  fontweight='bold')
+        axes[0].axis('off')
+
+        axes[1].imshow(to_np(mask_M, i),  cmap='Reds', vmin=0, vmax=1)
+        axes[1].set_title('Metal mask',    fontweight='bold')
+        axes[1].axis('off')
+
+        axes[2].imshow(to_np(mask_A, i),  cmap='hot',  vmin=0, vmax=1)
+        axes[2].set_title('Artifact mask', fontweight='bold')
+        axes[2].axis('off')
+
+        axes[3].imshow(to_np(fake_B, i),  cmap='gray', vmin=-1, vmax=1)
+        axes[3].set_title('Generated',     fontweight='bold')
+        axes[3].axis('off')
+
+        axes[4].imshow(to_np(real_B, i),  cmap='gray', vmin=-1, vmax=1)
+        axes[4].set_title('Ground truth',  fontweight='bold')
+        axes[4].axis('off')
+
+        plt.tight_layout()
+        fname = os.path.join(
+            save_dir,
+            f"diff_sample_{label_mode.lower()}_epoch{epoch:04d}_s{i:02d}.png"
+        )
+        plt.savefig(fname, dpi=130, bbox_inches='tight')
+        plt.close(fig)
