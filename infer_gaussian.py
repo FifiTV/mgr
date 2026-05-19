@@ -29,6 +29,7 @@ Examples:
 """
 
 import argparse
+import json
 import re
 import sys
 from pathlib import Path
@@ -254,13 +255,51 @@ def process_sample(img_id: int,
     print(f"  -> {fname}")
 
 
+# ── Metal info ─────────────────────────────────────────────────────────────────
+
+_MAT_ABBREV = {
+    'stainless_steel_316L': 'SS316L',
+    'Co':                   'Co',
+    'Ti':                   'Ti',
+    'Ti6Al4V':              'Ti6Al4V',
+    'Fe':                   'Fe',
+    'Au':                   'Au',
+    'Pt':                   'Pt',
+    'W':                    'W',
+}
+
+
+def load_metalinfo(path: Path | None) -> dict | None:
+    """Load metal object metadata from Mask/metalinfo JSON."""
+    if path is None or not path.exists():
+        return None
+    with open(path, encoding='utf-8') as f:
+        data = json.load(f)
+    names = [_MAT_ABBREV.get(m, m[:8]) for m in data.get('mat_name', [])]
+    diams = [round(d, 1) for d in data.get('diameter', [])]
+    return {
+        'n':         data.get('n_materials', 0),
+        'names':     names,
+        'diameters': diams,
+    }
+
+
+def format_metalinfo(info: dict | None) -> str:
+    if info is None:
+        return 'no metalinfo'
+    names_str = ', '.join(info['names'])
+    diam_str  = ', '.join(f'o{d}' for d in info['diameters'])
+    return f"n={info['n']} | {names_str} | {diam_str} mm"
+
+
 # ── Pair discovery ─────────────────────────────────────────────────────────────
 
 def find_pairs(body_dir: Path) -> list[dict]:
-    """Return sorted list of {img_id, clean_path, art_path, metal_path}."""
+    """Return sorted list of {img_id, clean_path, art_path, metal_path, metalinfo_path}."""
     baseline = body_dir / 'Baseline'
     target   = body_dir / 'Target'
     metal    = body_dir / 'Metal'
+    mask_dir = body_dir / 'Mask'
 
     if not target.exists():
         print(f"  WARNING: {body_dir}/Target not found — skipping.")
@@ -276,14 +315,16 @@ def find_pairs(body_dir: Path) -> list[dict]:
         if iid is None:
             continue
 
-        art_p   = baseline / f'training_body_metalart_img{iid}_512x512x1.raw'
-        metal_p = metal / f'training_body_metalonlymask_img{iid}_512x512x1.raw'
+        art_p      = baseline / f'training_body_metalart_img{iid}_512x512x1.raw'
+        metal_p    = metal    / f'training_body_metalonlymask_img{iid}_512x512x1.raw'
+        metalinfo_p = mask_dir / f'training_body_metalinfo{iid}.json'
 
         pairs.append({
-            'img_id':     iid,
-            'clean_path': clean_p,
-            'art_path':   art_p   if art_p.exists()   else None,
-            'metal_path': metal_p if metal_p.exists() else None,
+            'img_id':       iid,
+            'clean_path':   clean_p,
+            'art_path':     art_p       if art_p.exists()       else None,
+            'metal_path':   metal_p     if metal_p.exists()     else None,
+            'metalinfo_path': metalinfo_p if metalinfo_p.exists() else None,
         })
 
     return pairs
