@@ -1,0 +1,455 @@
+"""
+infer_gaussian.py -- Gaussian Vicinal DDPM inference and visualisation.
+
+Generates I_error for selected samples and saves PNG panels:
+  I_clean | M_metal | Gen I_error | Gen CT | Overlay | [Real I_error | Real CT]
+
+Examples:
+
+  # 5 images from body1, default paths
+  python infer_gaussian.py --body body1 --n 5
+
+  # Multiple bodies, more images, custom output
+  python infer_gaussian.py --body body1 body2 --n 10 --out results/gaussian_vis
+
+  # Faster sampling (every 10 steps instead of 1000)
+  python infer_gaussian.py --body body1 --n 5 --stride 10
+
+  # Custom model and features
+  python infer_gaussian.py --body body1 --n 5 \
+      --model results/models/gaussian/gaussian_unet_ema.pth \
+      --features results/features_norm.csv
+
+  # Fixed y_target (6 values in [0,1] comma-separated)
+  # peak_amplitude=0.8, rest=0.5 -> strong artifact
+  python infer_gaussian.py --body body1 --n 5 --y-target 0.8,0.5,0.5,0.5,0.5,0.5
+
+  # CPU
+  python infer_gaussian.py --body body1 --n 3 --cpu
+"""
+
+import argparse
+import re
+import sys
+from pathlib import Path
+
+import numpy as np
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+import torch
+
+sys.path.insert(0, str(Path(__file__).parent))
+
+import tomllib
+from src.models.gaussian_unet import GaussianUNet, GaussianDDPM
+from src.datasets.gaussian_dataset import (
+    load_features_df, normalize_ct, normalize_error, FEATURE_COLS
+)
+
+
+SHAPE = (512, 512)
+
+
+# ── Config ─────────────────────────────────────────────────────────────────────
+
+def load_config(path: str = "config.toml") -> dict:
+    with open(path, "rb") as f:
+        return tomllib.load(f)
+
+
+def load_raw(path: Path) -> np.ndarray:
+    return np.fromfile(path, dtype=np.float32).reshape(SHAPE)
+
+
+# ── Model ──────────────────────────────────────────────────────────────────────
+
+def load_model(model_path: Path, cfg: dict,
+               device: torch.device) -> GaussianDDPM:
+    gaus = cfg.get('gaussian', {})
+    feat_cols = gaus.get('feature_cols', None) or FEATURE_COLS
+    y_dim = len(feat_cols)
+
+    unet = GaussianUNet(
+        in_ch=3, out_ch=1,
+        base_ch=gaus.get('base_channels', 64),
+        t_emb_dim=gaus.get('t_emb_dim', 256),
+        y_dim=y_dim,
+        attn_heads=gaus.get('attn_heads', 8),
+    )
+    ddpm = GaussianDDPM(
+        unet=unet,
+        T=gaus.get('T', 1000),
+        beta_schedule=gaus.get('beta_schedule', 'linear'),
+        beta_start=gaus.get('beta_start', 1e-4),
+        beta_end=gaus.get('beta_end', 0.02),
+    )
+
+    ema_path = model_path.parent / (model_path.stem.replace('_ema', '')
+                                    .replace('gaussian_unet', 'gaussian_unet_ema') + model_path.suffix)
+    if '_ema' not in model_path.stem and ema_path.exists():
+        load_path = ema_path
+        print(f"  Using EMA weights: {load_path}")
+    else:
+        load_path = model_path
+
+    state = torch.load(load_path, map_location=device, weights_only=True)
+    # EMA state is stored as CPU tensors
+    state = {k: v.to(device) for k, v in state.items()}
+    # EMA dict wraps unet keys directly; raw weights may be under 'model_state'
+    if 'model_state' in state:
+        state = state['model_state']
+    unet.load_state_dict(state)
+    ddpm = ddpm.to(device)
+    ddpm.eval()
+    return ddpm
+
+
+# ── Sampling ───────────────────────────────────────────────────────────────────
+
+@torch.no_grad()
+def sample(ddpm: GaussianDDPM,
+           condition: torch.Tensor,
+           y_target: torch.Tensor,
+           stride: int = 1) -> np.ndarray:
+    """
+    DDPM reverse sampling with optional step stride for faster inference.
+
+    stride=1  : all 1000 steps (full quality)
+    stride=10 : 100 steps (~10x faster, slightly lower quality)
+    """
+    B, _, H, W = condition.shape
+    x = torch.randn(B, 1, H, W, device=condition.device)
+    T = ddpm.T
+
+    steps = list(reversed(range(0, T, stride)))
+
+    for t_val in steps:
+        t_batch  = torch.full((B,), t_val, device=x.device, dtype=torch.long)
+        model_in = torch.cat([x, condition], dim=1)
+        eps_pred = ddpm.unet(model_in, t_batch, y_target)
+
+        beta_t  = ddpm.betas[t_val]
+        alpha_t = ddpm.alphas[t_val]
+        ab_t    = ddpm.alphas_cumprod[t_val]
+
+        mean = (x - beta_t / (1 - ab_t).sqrt() * eps_pred) / alpha_t.sqrt()
+        x = mean + beta_t.sqrt() * torch.randn_like(x) if t_val > 0 else mean
+
+    return x.squeeze(0).squeeze(0).cpu().numpy()   # [H, W]
+
+
+# ── Visualisation ──────────────────────────────────────────────────────────────
+
+def save_figure(sample_panels: list[tuple[np.ndarray, str, str, tuple]],
+                title: str,
+                out_path: Path) -> None:
+    """
+    Save a row of panels. Each entry: (image, label, cmap, (vmin, vmax)).
+    """
+    n = len(sample_panels)
+    fig, axes = plt.subplots(1, n, figsize=(n * 4, 4.5))
+    if n == 1:
+        axes = [axes]
+
+    for ax, (img, label, cmap, (vmin, vmax)) in zip(axes, sample_panels):
+        im = ax.imshow(img, cmap=cmap, vmin=vmin, vmax=vmax)
+        ax.set_title(label, fontsize=8, fontweight='bold')
+        ax.axis('off')
+        plt.colorbar(im, ax=ax, fraction=0.046, pad=0.02)
+
+    fig.suptitle(title, fontsize=9, fontweight='bold')
+    plt.tight_layout()
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_path, dpi=130, bbox_inches='tight')
+    plt.close(fig)
+    print(f"  -> {out_path}")
+
+
+# ── Per-sample processing ──────────────────────────────────────────────────────
+
+def process_sample(img_id: int,
+                   body_name: str,
+                   clean_path: Path,
+                   art_path: Path | None,
+                   metal_path: Path | None,
+                   y_vec: np.ndarray,
+                   feature_cols: list[str],
+                   ddpm: GaussianDDPM,
+                   error_scale: float,
+                   stride: int,
+                   device: torch.device,
+                   out_dir: Path,
+                   idx: int) -> None:
+
+    i_clean_raw = load_raw(clean_path)
+    i_art_raw   = load_raw(art_path)   if art_path   else None
+    m_metal_raw = load_raw(metal_path) if metal_path else None
+
+    i_clean_n = normalize_ct(i_clean_raw)
+    m_metal_n = (m_metal_raw > 0.5).astype(np.float32) if m_metal_raw is not None else \
+                np.zeros(SHAPE, dtype=np.float32)
+
+    def t(arr): return torch.from_numpy(arr[None, None]).float().to(device)
+
+    condition = torch.cat([t(i_clean_n), t(m_metal_n)], dim=1)
+    y_t       = torch.from_numpy(y_vec[None]).float().to(device)
+
+    i_error_gen    = sample(ddpm, condition, y_t, stride=stride)
+    i_metal_gen_hu = i_clean_raw + i_error_gen * error_scale
+
+    panels = []
+
+    panels.append((i_clean_n,   'I_clean\n(input)',        'gray', (-1, 1)))
+    panels.append((m_metal_n,   'M_metal\n(metal mask)',   'hot',  (0, 1)))
+    panels.append((i_error_gen, 'Gen I_error\n(model output)', 'RdBu', (-1, 1)))
+
+    i_metal_gen_vis = np.clip(i_metal_gen_hu, -1000, 3000)
+    i_metal_gen_vis = (i_metal_gen_vis - (-1000)) / (3000 - (-1000)) * 2 - 1
+    panels.append((i_metal_gen_vis, 'Gen CT\n(I_clean + gen artifact)', 'gray', (-1, 1)))
+
+    overlay_base     = (i_clean_n + 1) / 2
+    artifact_overlay = np.clip(i_error_gen, 0, 1)
+    overlay_rgb = np.stack([
+        np.clip(overlay_base + artifact_overlay * 0.6, 0, 1),
+        np.clip(overlay_base - artifact_overlay * 0.3, 0, 1),
+        np.clip(overlay_base - artifact_overlay * 0.3, 0, 1),
+    ], axis=-1)
+    panels.append((overlay_rgb, 'Overlay\n(red = gen artifact)', None, (0, 1)))
+
+    if i_art_raw is not None:
+        i_error_real   = i_art_raw - i_clean_raw
+        i_error_real_n = np.clip(i_error_real, -error_scale, error_scale) / error_scale
+        i_art_vis      = np.clip(i_art_raw, -1000, 3000)
+        i_art_vis      = (i_art_vis - (-1000)) / (3000 - (-1000)) * 2 - 1
+        panels.append((i_error_real_n, 'Real I_error\n(ground truth)', 'RdBu', (-1, 1)))
+        panels.append((i_art_vis,      'Real CT\n(I_metal gt)',         'gray',  (-1, 1)))
+
+    # ── Feature subtitle ───────────────────────────────────────────────────────
+    feat_str = '  '.join(f'{c[:6]}={v:.2f}' for c, v in zip(feature_cols, y_vec))
+    title = f'{body_name}/img{img_id}  |  y=[{feat_str}]'
+
+    # ── Overlay panel needs special handling (RGB) ─────────────────────────────
+    n = len(panels)
+    fig, axes = plt.subplots(1, n, figsize=(n * 4, 4.8))
+    if n == 1:
+        axes = [axes]
+
+    for ax, (img, label, cmap, (vmin, vmax)) in zip(axes, panels):
+        if cmap is None:
+            ax.imshow(img)           # RGB, no colormap
+        else:
+            im = ax.imshow(img, cmap=cmap, vmin=vmin, vmax=vmax)
+            plt.colorbar(im, ax=ax, fraction=0.046, pad=0.02)
+        ax.set_title(label, fontsize=8, fontweight='bold')
+        ax.axis('off')
+
+    fig.suptitle(title, fontsize=8)
+    plt.tight_layout()
+
+    fname = out_dir / f'gauss_{idx:04d}_{body_name}_img{img_id}.png'
+    fname.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(fname, dpi=130, bbox_inches='tight')
+    plt.close(fig)
+    print(f"  -> {fname}")
+
+
+# ── Pair discovery ─────────────────────────────────────────────────────────────
+
+def find_pairs(body_dir: Path) -> list[dict]:
+    """Return sorted list of {img_id, clean_path, art_path, metal_path}."""
+    baseline = body_dir / 'Baseline'
+    target   = body_dir / 'Target'
+    metal    = body_dir / 'Metal'
+
+    if not target.exists():
+        print(f"  WARNING: {body_dir}/Target not found — skipping.")
+        return []
+
+    def img_id(p: Path):
+        m = re.search(r'img(\d+)', p.stem)
+        return int(m.group(1)) if m else None
+
+    pairs = []
+    for clean_p in sorted(target.glob('*.raw')):
+        iid = img_id(clean_p)
+        if iid is None:
+            continue
+
+        art_p   = baseline / f'training_body_metalart_img{iid}_512x512x1.raw'
+        metal_p = metal / f'training_body_metalonlymask_img{iid}_512x512x1.raw'
+
+        pairs.append({
+            'img_id':     iid,
+            'clean_path': clean_p,
+            'art_path':   art_p   if art_p.exists()   else None,
+            'metal_path': metal_p if metal_p.exists() else None,
+        })
+
+    return pairs
+
+
+# ── CLI ────────────────────────────────────────────────────────────────────────
+
+def main():
+    parser = argparse.ArgumentParser(
+        description='Gaussian Vicinal DDPM — inference and visualisation',
+        formatter_class=argparse.RawTextHelpFormatter,
+    )
+
+    parser.add_argument(
+        '--body', nargs='+', default=['body1'],
+        help='Body variant name(s) (e.g. body1 body2). Default: body1'
+    )
+    parser.add_argument(
+        '--n', type=int, default=5,
+        help='Maximum number of images to process (default: 5)'
+    )
+    parser.add_argument(
+        '--data-path', type=str, default=None,
+        help='Path to RPI directory (overrides config paths.rpi_path)'
+    )
+    parser.add_argument(
+        '--model', type=Path, default=None,
+        help='Path to .pth model file. Default: results/models/gaussian/gaussian_unet_ema.pth'
+    )
+    parser.add_argument(
+        '--features', type=Path, default=None,
+        help='Path to normalized features CSV. Default: results/features_norm.csv'
+    )
+    parser.add_argument(
+        '--out', type=Path, default=Path('results/gaussian_infer'),
+        help='Output directory for PNGs. Default: results/gaussian_infer'
+    )
+    parser.add_argument(
+        '--config', default='config.toml',
+        help='Path to config.toml'
+    )
+    parser.add_argument(
+        '--stride', type=int, default=1,
+        help=(
+            'DDPM sampling stride (default: 1 = full 1000 steps).\n'
+            'stride=10 -> 100 steps, ~10x faster, slightly lower quality.\n'
+            'stride=50 -> 20 steps, fast, for debugging.'
+        )
+    )
+    parser.add_argument(
+        '--y-target', type=str, default=None,
+        help=(
+            '6 comma-separated values in [0,1] — overrides per-image features from CSV.\n'
+            'Order: peak_amplitude,spatial_extent,bbox_ratio,\n'
+            '       dark_to_bright_ratio,angular_concentration,texture_roughness\n'
+            'Example: --y-target 0.8,0.5,0.5,0.5,0.5,0.5  (strong artifact)'
+        )
+    )
+    parser.add_argument(
+        '--cpu', action='store_true',
+        help='Force CPU even when CUDA is available'
+    )
+
+    args = parser.parse_args()
+
+    cfg    = load_config(args.config)
+    device = torch.device('cpu' if args.cpu else ('cuda' if torch.cuda.is_available() else 'cpu'))
+    print(f'Device: {device}')
+
+    gaus_cfg = cfg.get('gaussian', {})
+    error_scale  = gaus_cfg.get('error_scale', 642.8)
+    feature_cols = gaus_cfg.get('feature_cols', None) or FEATURE_COLS
+
+    # ── Resolve paths ──────────────────────────────────────────────────────────
+    paths_cfg = cfg.get('paths', {})
+    rpi_base  = Path(args.data_path or paths_cfg.get('rpi_path', 'data/raw/RPI'))
+
+    model_path = args.model or Path(
+        paths_cfg.get('results_dir', 'results'),
+        'models', 'gaussian', 'gaussian_unet_ema.pth'
+    )
+    # fallback to raw weights if EMA not found
+    if not model_path.exists():
+        raw_path = model_path.parent / 'gaussian_unet.pth'
+        if raw_path.exists():
+            model_path = raw_path
+        else:
+            sys.exit(f'Model not found: {model_path}\nProvide --model or train first.')
+
+    features_path = args.features or Path(
+        paths_cfg.get('results_dir', 'results'), 'features_norm.csv'
+    )
+    if not features_path.exists():
+        sys.exit(f'Features file not found: {features_path}\nProvide --features.')
+
+    # ── Load model and features ────────────────────────────────────────────────
+    print(f'Loading model: {model_path}')
+    ddpm = load_model(model_path, cfg, device)
+
+    print(f'Loading features: {features_path}')
+    features_df = load_features_df(features_path)
+
+    fixed_y = None
+    if args.y_target:
+        vals = [float(v) for v in args.y_target.split(',')]
+        if len(vals) != len(feature_cols):
+            sys.exit(f'--y-target requires {len(feature_cols)} values, got {len(vals)}.')
+        fixed_y = np.array(vals, dtype=np.float32)
+        print(f'Using fixed y_target: {dict(zip(feature_cols, fixed_y))}')
+
+    all_samples = []
+    for body_name in args.body:
+        body_dir = rpi_base / body_name
+        if not body_dir.exists():
+            print(f'WARNING: {body_dir} does not exist — skipping.')
+            continue
+
+        body_feats = features_df[features_df['source'] == body_name]
+        if body_feats.empty:
+            print(f'WARNING: no features found for source={body_name!r} — skipping.')
+            continue
+
+        feat_ids = set(body_feats.index.tolist())
+        pairs    = find_pairs(body_dir)
+        pairs    = [p for p in pairs if p['img_id'] in feat_ids]
+
+        if not pairs:
+            print(f'WARNING: no matching pairs found for {body_name}.')
+            continue
+
+        # Limit per body proportionally
+        per_body = max(1, args.n // len(args.body))
+        for rec in pairs[:per_body]:
+            iid   = rec['img_id']
+            y_vec = fixed_y if fixed_y is not None else \
+                    body_feats.loc[iid, feature_cols].values.astype(np.float32)
+            all_samples.append({**rec, 'body': body_name, 'y': y_vec})
+
+    # Trim to exactly --n
+    all_samples = all_samples[:args.n]
+
+    if not all_samples:
+        sys.exit('No samples found. Check --body and --data-path.')
+
+    print(f'\nProcessing {len(all_samples)} samples (stride={args.stride}) -> {args.out}/\n')
+
+    for idx, s in enumerate(all_samples):
+        print(f'[{idx+1}/{len(all_samples)}] {s["body"]}/img{s["img_id"]}')
+        process_sample(
+            img_id=s['img_id'],
+            body_name=s['body'],
+            clean_path=s['clean_path'],
+            art_path=s['art_path'],
+            metal_path=s['metal_path'],
+            y_vec=s['y'],
+            feature_cols=feature_cols,
+            ddpm=ddpm,
+            error_scale=error_scale,
+            stride=args.stride,
+            device=device,
+            out_dir=args.out,
+            idx=idx,
+        )
+
+    print(f'\nDone. Results saved to: {args.out}/')
+
+
+if __name__ == '__main__':
+    main()
