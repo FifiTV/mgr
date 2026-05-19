@@ -235,6 +235,7 @@ def main():
                 dataloader_soft, dataloader_hard,
                 config, device,
                 output_dir,
+                label_mode=args.label_mode,
             )
         
         elif args.type == 'gaussian':

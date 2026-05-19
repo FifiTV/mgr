@@ -78,7 +78,8 @@ class EMA:
 
 def train_diffusion(dataloader_soft: DataLoader, dataloader_hard: DataLoader,
                     config: dict, device: torch.device,
-                    output_dir: str) -> None:
+                    output_dir: str,
+                    label_mode: str = None) -> None:
     """
     Train Diffusion model with soft and hard labels.
 
@@ -88,6 +89,7 @@ def train_diffusion(dataloader_soft: DataLoader, dataloader_hard: DataLoader,
         config: Configuration dictionary
         device: Computation device (cuda/cpu)
         output_dir: Directory to save model checkpoints
+        label_mode: Train only 'soft' or 'hard'. Default: train both.
     """
     logger.info("=" * 60)
     logger.info("Starting Diffusion Model Training")
@@ -107,7 +109,11 @@ def train_diffusion(dataloader_soft: DataLoader, dataloader_hard: DataLoader,
     logger.info(f"Epochs: {epochs}  LR: {lr}  EMA decay: {ema_decay}  Warmup: {warmup}")
     logger.info(f"Mask dropout probability: {mask_dropout}")
 
-    for mode_name, dataloader in [("SOFT", dataloader_soft), ("HARD", dataloader_hard)]:
+    all_modes = [("SOFT", dataloader_soft), ("HARD", dataloader_hard)]
+    if label_mode is not None:
+        all_modes = [(m, dl) for m, dl in all_modes if m == label_mode.upper()]
+
+    for mode_name, dataloader in all_modes:
         logger.info(f"\n{'='*40}")
         logger.info(f"Training {mode_name} Labels Diffusion Model  ({epochs} epochs)")
         logger.info(f"{'='*40}")
