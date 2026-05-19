@@ -39,6 +39,7 @@ def train_cyclegan(
     real_val_metal_max: Optional[int] = None,
     real_path: Optional[str] = None,
     rpi_path: Optional[str] = None,
+    label_mode: Optional[str] = None,
 ) -> None:
     """
     Train CycleGAN model with mixed data sources.
@@ -157,11 +158,15 @@ def train_cyclegan(
     logger.info(f"Learning rate: {lr}, Lambda_cycle: {lambda_cyc}, "
                 f"Lambda_identity: {lambda_id}, Lambda_supervised: {lambda_sup}")
     
-    # Train both soft and hard label versions
-    for label_mode, (gen_loader, disc_loader, val_loader) in [
+    all_modes = [
         ("SOFT", (gen_soft, disc_soft, val_soft)),
-        ("HARD", (gen_hard, disc_hard, val_hard))
-    ]:
+        ("HARD", (gen_hard, disc_hard, val_hard)),
+    ]
+    if label_mode is not None:
+        all_modes = [(m, loaders) for m, loaders in all_modes
+                     if m == label_mode.upper()]
+
+    for label_mode, (gen_loader, disc_loader, val_loader) in all_modes:
         logger.info(f"\n{'=' * 70}")
         logger.info(f"Training {label_mode} Labels Model")
         logger.info(f"{'=' * 70}")

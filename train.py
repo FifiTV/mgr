@@ -47,6 +47,12 @@ def main():
         help='Model type: cycle (CycleGAN), diff (Diffusion), gaussian (Gaussian Vicinal DDPM)'
     )
     parser.add_argument(
+        '--label-mode',
+        choices=['soft', 'hard'],
+        default=None,
+        help='Train only this label mode (soft or hard). Default: train both.'
+    )
+    parser.add_argument(
         '--data-source',
         choices=['real', 'rpi', 'both'],
         default='rpi',
@@ -202,6 +208,7 @@ def main():
                 real_val_metal_max=real_val_max,
                 real_path=real_path,
                 rpi_path=rpi_path,
+                label_mode=args.label_mode,
             )
         elif args.type == 'diff':
             logger.info(f"Loading dataset from source '{args.data_source}' ({data_path})...")
