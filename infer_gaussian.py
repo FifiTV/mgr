@@ -174,10 +174,12 @@ def process_sample(img_id: int,
                    clean_path: Path,
                    art_path: Path | None,
                    metal_path: Path | None,
+                   metalinfo: dict | None,
                    y_vec: np.ndarray,
                    feature_cols: list[str],
                    ddpm: GaussianDDPM,
                    error_scale: float,
+                   metal_threshold_hu: float,
                    stride: int,
                    device: torch.device,
                    out_dir: Path,
@@ -188,8 +190,13 @@ def process_sample(img_id: int,
     m_metal_raw = load_raw(metal_path) if metal_path else None
 
     i_clean_n = normalize_ct(i_clean_raw)
-    m_metal_n = (m_metal_raw > 0.5).astype(np.float32) if m_metal_raw is not None else \
-                np.zeros(SHAPE, dtype=np.float32)
+    if m_metal_raw is not None:
+        m_metal_n = (m_metal_raw > 0.5).astype(np.float32)
+    elif i_art_raw is not None:
+        # Same fallback as gaussian_dataset._get_metal_mask: diff threshold
+        m_metal_n = (np.abs(i_art_raw - i_clean_raw) > metal_threshold_hu).astype(np.float32)
+    else:
+        m_metal_n = np.zeros(SHAPE, dtype=np.float32)
 
     def t(arr): return torch.from_numpy(arr[None, None]).float().to(device)
 
@@ -227,8 +234,9 @@ def process_sample(img_id: int,
         panels.append((i_art_vis,      'Real CT\n(I_metal gt)',         'gray',  (-1, 1)))
 
     # ── Feature subtitle ───────────────────────────────────────────────────────
-    feat_str = '  '.join(f'{c[:6]}={v:.2f}' for c, v in zip(feature_cols, y_vec))
-    title = f'{body_name}/img{img_id}  |  y=[{feat_str}]'
+    feat_str  = '  '.join(f'{c[:6]}={v:.2f}' for c, v in zip(feature_cols, y_vec))
+    metal_str = format_metalinfo(metalinfo)
+    title = f'{body_name}/img{img_id}  |  {metal_str}\ny=[{feat_str}]'
 
     # ── Overlay panel needs special handling (RGB) ─────────────────────────────
     n = len(panels)
@@ -394,9 +402,11 @@ def main():
     device = torch.device('cpu' if args.cpu else ('cuda' if torch.cuda.is_available() else 'cpu'))
     print(f'Device: {device}')
 
-    gaus_cfg = cfg.get('gaussian', {})
-    error_scale  = gaus_cfg.get('error_scale', 642.8)
-    feature_cols = gaus_cfg.get('feature_cols', None) or FEATURE_COLS
+    gaus_cfg           = cfg.get('gaussian', {})
+    error_scale        = gaus_cfg.get('error_scale', 642.8)
+    metal_threshold_hu = gaus_cfg.get('metal_threshold_hu',
+                         cfg.get('data', {}).get('metal_threshold_hu', 2500.0))
+    feature_cols       = gaus_cfg.get('feature_cols', None) or FEATURE_COLS
 
     # ── Resolve paths ──────────────────────────────────────────────────────────
     paths_cfg = cfg.get('paths', {})
@@ -472,17 +482,20 @@ def main():
     print(f'\nProcessing {len(all_samples)} samples (stride={args.stride}) -> {args.out}/\n')
 
     for idx, s in enumerate(all_samples):
-        print(f'[{idx+1}/{len(all_samples)}] {s["body"]}/img{s["img_id"]}')
+        metalinfo = load_metalinfo(s['metalinfo_path'])
+        print(f'[{idx+1}/{len(all_samples)}] {s["body"]}/img{s["img_id"]}  {format_metalinfo(metalinfo)}')
         process_sample(
             img_id=s['img_id'],
             body_name=s['body'],
             clean_path=s['clean_path'],
             art_path=s['art_path'],
             metal_path=s['metal_path'],
+            metalinfo=metalinfo,
             y_vec=s['y'],
             feature_cols=feature_cols,
             ddpm=ddpm,
             error_scale=error_scale,
+            metal_threshold_hu=metal_threshold_hu,
             stride=args.stride,
             device=device,
             out_dir=args.out,
