@@ -140,6 +140,74 @@ def sample(ddpm: GaussianDDPM,
     return x.squeeze(0).squeeze(0).cpu().numpy()   # [H, W]
 
 
+# ── Raw output saving ─────────────────────────────────────────────────────────
+
+def save_raw_outputs(
+    out_dir: Path,
+    stem: str,
+    i_error_gen: np.ndarray,
+    i_metal_gen_hu: np.ndarray,
+    i_clean_raw: np.ndarray,
+    i_art_raw: np.ndarray | None,
+) -> None:
+    """Save generated maps as float32 .raw files (512x512 each)."""
+    raw_dir = out_dir / 'raw'
+    img_dir = raw_dir / 'img'
+    img_dir.mkdir(parents=True, exist_ok=True)
+
+    # Model output — lives in raw/ directly
+    (raw_dir / f'{stem}_gen_error.raw').write_bytes(i_error_gen.astype(np.float32).tobytes())
+    # Derived images — lives in raw/img/
+    (img_dir / f'{stem}_clean.raw').write_bytes(i_clean_raw.astype(np.float32).tobytes())
+    (img_dir / f'{stem}_gen_ct.raw').write_bytes(i_metal_gen_hu.astype(np.float32).tobytes())
+    if i_art_raw is not None:
+        (img_dir / f'{stem}_real_art.raw').write_bytes(i_art_raw.astype(np.float32).tobytes())
+
+
+def save_metadata(
+    out_dir: Path,
+    stem: str,
+    img_id: int,
+    body_name: str,
+    y_vec: np.ndarray,
+    feature_cols: list[str],
+    error_scale: float,
+    seed: int,
+    metalinfo: dict | None,
+) -> None:
+    """Save inference metadata alongside the raw model output."""
+    raw_dir = out_dir / 'raw'
+    raw_dir.mkdir(parents=True, exist_ok=True)
+
+    y_target = [round(float(v), 6) for v in y_vec]
+
+    # peak_amplitude maps to HU via error_scale; other features are dimensionless
+    y_target_hu: dict[str, float] = {}
+    for col, val in zip(feature_cols, y_vec):
+        if col == 'peak_amplitude':
+            y_target_hu[col] = round(float(val) * error_scale, 2)
+        else:
+            y_target_hu[col] = round(float(val), 6)
+
+    meta: dict = {
+        'img_id':          img_id,
+        'source':          'generated',
+        'body':            body_name,
+        'metal_source':    f'{body_name}/img{img_id}',
+        'seed':            seed,
+        'error_scale':     error_scale,
+        'y_target':        y_target,
+        'y_target_named':  {c: round(float(v), 6) for c, v in zip(feature_cols, y_vec)},
+        'y_target_hu':     y_target_hu,
+    }
+    if metalinfo is not None:
+        meta['metalinfo'] = metalinfo
+
+    path = raw_dir / f'{stem}.json'
+    path.write_text(json.dumps(meta, indent=2, ensure_ascii=False), encoding='utf-8')
+    print(f'  -> {path}')
+
+
 # ── Visualisation ──────────────────────────────────────────────────────────────
 
 def save_figure(sample_panels: list[tuple[np.ndarray, str, str, tuple]],
@@ -183,7 +251,8 @@ def process_sample(img_id: int,
                    stride: int,
                    device: torch.device,
                    out_dir: Path,
-                   idx: int) -> None:
+                   idx: int,
+                   seed: int = -1) -> None:
 
     i_clean_raw = load_raw(clean_path)
     i_art_raw   = load_raw(art_path)   if art_path   else None
@@ -203,8 +272,17 @@ def process_sample(img_id: int,
     condition = torch.cat([t(i_clean_n), t(m_metal_n)], dim=1)
     y_t       = torch.from_numpy(y_vec[None]).float().to(device)
 
+    if seed >= 0:
+        torch.manual_seed(seed)
+    actual_seed = int(torch.initial_seed())
+
     i_error_gen    = sample(ddpm, condition, y_t, stride=stride)
     i_metal_gen_hu = i_clean_raw + i_error_gen * error_scale
+
+    stem = f'gauss_{idx:04d}_{body_name}_img{img_id}'
+    save_raw_outputs(out_dir, stem, i_error_gen, i_metal_gen_hu, i_clean_raw, i_art_raw)
+    save_metadata(out_dir, stem, img_id, body_name, y_vec, feature_cols,
+                  error_scale, actual_seed, metalinfo)
 
     panels = []
 
@@ -395,6 +473,14 @@ def main():
         '--cpu', action='store_true',
         help='Force CPU even when CUDA is available'
     )
+    parser.add_argument(
+        '--seed', type=int, default=-1,
+        help=(
+            'Base random seed for reproducible sampling.\n'
+            'Sample i gets seed (base + i). -1 = random (default).\n'
+            'Saved in per-sample metadata JSON.'
+        )
+    )
 
     args = parser.parse_args()
 
@@ -500,6 +586,7 @@ def main():
             device=device,
             out_dir=args.out,
             idx=idx,
+            seed=args.seed + idx if args.seed >= 0 else -1,
         )
 
     print(f'\nDone. Results saved to: {args.out}/')
