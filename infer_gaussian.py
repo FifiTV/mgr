@@ -429,8 +429,8 @@ def main():
         help='Body variant name(s) (e.g. body1 body2). Default: body1'
     )
     parser.add_argument(
-        '--n', type=int, default=5,
-        help='Maximum number of images to process (default: 5)'
+        '--n', type=int, default=0,
+        help='Maximum number of images to process. 0 = all (default: 0)'
     )
     parser.add_argument(
         '--data-path', type=str, default=None,
@@ -551,16 +551,16 @@ def main():
             print(f'WARNING: no matching pairs found for {body_name}.')
             continue
 
-        # Limit per body proportionally
-        per_body = max(1, args.n // len(args.body))
+        # Limit per body proportionally (0 = all)
+        per_body = len(pairs) if args.n == 0 else max(1, args.n // len(args.body))
         for rec in pairs[:per_body]:
             iid   = rec['img_id']
             y_vec = fixed_y if fixed_y is not None else \
                     body_feats.loc[iid, feature_cols].values.astype(np.float32)
             all_samples.append({**rec, 'body': body_name, 'y': y_vec})
 
-    # Trim to exactly --n
-    all_samples = all_samples[:args.n]
+    if args.n > 0:
+        all_samples = all_samples[:args.n]
 
     if not all_samples:
         sys.exit('No samples found. Check --body and --data-path.')
