@@ -42,102 +42,8 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).parent))
 
-import tomllib
-from src.models.gaussian_unet import GaussianUNet, GaussianDDPM
-from src.datasets.gaussian_dataset import (
-    load_features_df, normalize_ct, normalize_error, FEATURE_COLS
-)
-
-
-SHAPE = (512, 512)
-
-
-# ── Config ─────────────────────────────────────────────────────────────────────
-
-def load_config(path: str = "config.toml") -> dict:
-    with open(path, "rb") as f:
-        return tomllib.load(f)
-
-
-def load_raw(path: Path) -> np.ndarray:
-    return np.fromfile(path, dtype=np.float32).reshape(SHAPE)
-
-
-# ── Model ──────────────────────────────────────────────────────────────────────
-
-def load_model(model_path: Path, cfg: dict,
-               device: torch.device) -> GaussianDDPM:
-    gaus = cfg.get('gaussian', {})
-    feat_cols = gaus.get('feature_cols', None) or FEATURE_COLS
-    y_dim = len(feat_cols)
-
-    unet = GaussianUNet(
-        in_ch=3, out_ch=1,
-        base_ch=gaus.get('base_channels', 64),
-        t_emb_dim=gaus.get('t_emb_dim', 256),
-        y_dim=y_dim,
-        attn_heads=gaus.get('attn_heads', 8),
-    )
-    ddpm = GaussianDDPM(
-        unet=unet,
-        T=gaus.get('T', 1000),
-        beta_schedule=gaus.get('beta_schedule', 'linear'),
-        beta_start=gaus.get('beta_start', 1e-4),
-        beta_end=gaus.get('beta_end', 0.02),
-    )
-
-    ema_path = model_path.parent / (model_path.stem.replace('_ema', '')
-                                    .replace('gaussian_unet', 'gaussian_unet_ema') + model_path.suffix)
-    if '_ema' not in model_path.stem and ema_path.exists():
-        load_path = ema_path
-        print(f"  Using EMA weights: {load_path}")
-    else:
-        load_path = model_path
-
-    state = torch.load(load_path, map_location=device, weights_only=True)
-    # EMA state is stored as CPU tensors
-    state = {k: v.to(device) for k, v in state.items()}
-    # EMA dict wraps unet keys directly; raw weights may be under 'model_state'
-    if 'model_state' in state:
-        state = state['model_state']
-    unet.load_state_dict(state)
-    ddpm = ddpm.to(device)
-    ddpm.eval()
-    return ddpm
-
-
-# ── Sampling ───────────────────────────────────────────────────────────────────
-
-@torch.no_grad()
-def sample(ddpm: GaussianDDPM,
-           condition: torch.Tensor,
-           y_target: torch.Tensor,
-           stride: int = 1) -> np.ndarray:
-    """
-    DDPM reverse sampling with optional step stride for faster inference.
-
-    stride=1  : all 1000 steps (full quality)
-    stride=10 : 100 steps (~10x faster, slightly lower quality)
-    """
-    B, _, H, W = condition.shape
-    x = torch.randn(B, 1, H, W, device=condition.device)
-    T = ddpm.T
-
-    steps = list(reversed(range(0, T, stride)))
-
-    for t_val in steps:
-        t_batch  = torch.full((B,), t_val, device=x.device, dtype=torch.long)
-        model_in = torch.cat([x, condition], dim=1)
-        eps_pred = ddpm.unet(model_in, t_batch, y_target)
-
-        beta_t  = ddpm.betas[t_val]
-        alpha_t = ddpm.alphas[t_val]
-        ab_t    = ddpm.alphas_cumprod[t_val]
-
-        mean = (x - beta_t / (1 - ab_t).sqrt() * eps_pred) / alpha_t.sqrt()
-        x = mean + beta_t.sqrt() * torch.randn_like(x) if t_val > 0 else mean
-
-    return x.squeeze(0).squeeze(0).cpu().numpy()   # [H, W]
+from src.datasets.gaussian_dataset import load_features_df, normalize_ct, normalize_error
+from infer_utils import SHAPE, load_config, load_raw, load_model, ddpm_sample
 
 
 # ── Raw output saving ─────────────────────────────────────────────────────────
@@ -276,7 +182,7 @@ def process_sample(img_id: int,
         torch.manual_seed(seed)
     actual_seed = int(torch.initial_seed())
 
-    i_error_gen    = sample(ddpm, condition, y_t, stride=stride)
+    i_error_gen    = ddpm_sample(ddpm, condition, y_t, stride=stride, seed=seed if seed >= 0 else None)
     i_metal_gen_hu = i_clean_raw + i_error_gen * error_scale
 
     stem = f'gauss_{idx:04d}_{body_name}_img{img_id}'
@@ -492,7 +398,6 @@ def main():
     error_scale        = gaus_cfg.get('error_scale', 642.8)
     metal_threshold_hu = gaus_cfg.get('metal_threshold_hu',
                          cfg.get('data', {}).get('metal_threshold_hu', 2500.0))
-    feature_cols       = gaus_cfg.get('feature_cols', None) or FEATURE_COLS
 
     # ── Resolve paths ──────────────────────────────────────────────────────────
     paths_cfg = cfg.get('paths', {})
@@ -518,7 +423,7 @@ def main():
 
     # ── Load model and features ────────────────────────────────────────────────
     print(f'Loading model: {model_path}')
-    ddpm = load_model(model_path, cfg, device)
+    ddpm, feature_cols = load_model(model_path, cfg, device)
 
     print(f'Loading features: {features_path}')
     features_df = load_features_df(features_path)

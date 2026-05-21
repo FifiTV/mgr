@@ -41,11 +41,8 @@ import torch
 _ROOT = Path(__file__).parent.parent.parent   # mgr/
 sys.path.insert(0, str(_ROOT))
 
-import tomllib
-from src.models.gaussian_unet import GaussianUNet, GaussianDDPM
-from src.datasets.gaussian_dataset import load_features_df, normalize_ct, FEATURE_COLS
-
-SHAPE = (512, 512)
+from src.datasets.gaussian_dataset import load_features_df, normalize_ct
+from infer_utils import SHAPE, load_config, load_raw, load_model, ddpm_sample, GaussianDDPM
 
 _FEATURE_LABELS: dict[str, str] = {
     'peak_amplitude':        'Peak amplitude',
@@ -57,16 +54,7 @@ _FEATURE_LABELS: dict[str, str] = {
 }
 
 
-# ── Config & model loading ─────────────────────────────────────────────────────
-
-def load_config(path: Path) -> dict:
-    with open(path, 'rb') as f:
-        return tomllib.load(f)
-
-
-def load_raw(path: Path) -> np.ndarray:
-    return np.fromfile(path, dtype=np.float32).reshape(SHAPE)
-
+# ── Model path resolution ──────────────────────────────────────────────────────
 
 def resolve_model_path(model_arg: Path | None, model_dir_arg: Path | None,
                        cfg: dict) -> Path:
@@ -86,36 +74,6 @@ def resolve_model_path(model_arg: Path | None, model_dir_arg: Path | None,
         if candidate.exists():
             return candidate
     sys.exit(f'No model found in {d}. Provide --model or --model-dir.')
-
-
-def load_model(model_path: Path, cfg: dict, device: torch.device) -> tuple[GaussianDDPM, list[str]]:
-    gaus = cfg.get('gaussian', {})
-    feature_cols = gaus.get('feature_cols', None) or FEATURE_COLS
-    y_dim = len(feature_cols)
-
-    unet = GaussianUNet(
-        in_ch=3, out_ch=1,
-        base_ch=gaus.get('base_channels', 64),
-        t_emb_dim=gaus.get('t_emb_dim', 256),
-        y_dim=y_dim,
-        attn_heads=gaus.get('attn_heads', 8),
-    )
-    ddpm = GaussianDDPM(
-        unet=unet,
-        T=gaus.get('T', 1000),
-        beta_schedule=gaus.get('beta_schedule', 'linear'),
-        beta_start=gaus.get('beta_start', 1e-4),
-        beta_end=gaus.get('beta_end', 0.02),
-    )
-    state = torch.load(model_path, map_location=device, weights_only=True)
-    state = {k: v.to(device) for k, v in state.items()}
-    if 'model_state' in state:
-        state = state['model_state']
-    unet.load_state_dict(state)
-    ddpm = ddpm.to(device)
-    ddpm.eval()
-    print(f'Model: {model_path}  (y_dim={y_dim}, features={feature_cols})')
-    return ddpm, feature_cols
 
 
 # ── Anchor image ───────────────────────────────────────────────────────────────
@@ -195,32 +153,6 @@ def compute_medians(features_df, feature_cols: list[str], body: str) -> np.ndarr
     return medians
 
 
-# ── Sampling ───────────────────────────────────────────────────────────────────
-
-@torch.no_grad()
-def sample_ddpm(ddpm: GaussianDDPM,
-                condition: torch.Tensor,
-                y_t: torch.Tensor,
-                seed: int,
-                stride: int = 1) -> np.ndarray:
-    """DDPM reverse sampling with a fixed noise seed (reseeded per call)."""
-    B, _, H, W = condition.shape
-    torch.manual_seed(seed)                      # same noise for every cell
-    x = torch.randn(B, 1, H, W, device=condition.device)
-    T = ddpm.T
-
-    for t_val in reversed(range(0, T, stride)):
-        t_batch  = torch.full((B,), t_val, device=x.device, dtype=torch.long)
-        eps_pred = ddpm.unet(torch.cat([x, condition], dim=1), t_batch, y_t)
-        beta_t   = ddpm.betas[t_val]
-        alpha_t  = ddpm.alphas[t_val]
-        ab_t     = ddpm.alphas_cumprod[t_val]
-        mean = (x - beta_t / (1 - ab_t).sqrt() * eps_pred) / alpha_t.sqrt()
-        x = mean + beta_t.sqrt() * torch.randn_like(x) if t_val > 0 else mean
-
-    return x.squeeze(0).squeeze(0).cpu().numpy()
-
-
 # ── Reference image ───────────────────────────────────────────────────────────
 
 def generate_reference(
@@ -242,7 +174,7 @@ def generate_reference(
     Returns (gen_array, row_dict) for CSV inclusion.
     """
     y_t = torch.from_numpy(y_vec[None]).float().to(device)
-    gen = sample_ddpm(ddpm, condition, y_t, seed=seed, stride=stride)
+    gen = ddpm_sample(ddpm, condition, y_t, stride=stride, seed=seed)
 
     i_clean_n = condition[0, 0].cpu().numpy()
 
@@ -339,7 +271,7 @@ def render_ablation_grid(
             y_vec[feat_idx] = float(val)
             y_t = torch.from_numpy(y_vec[None]).float().to(device)
 
-            gen = sample_ddpm(ddpm, condition, y_t, seed=seed, stride=stride)
+            gen = ddpm_sample(ddpm, condition, y_t, stride=stride, seed=seed)
 
             ax = axes[fi, ci]
             ax.imshow(gen, cmap='RdBu', vmin=-1, vmax=1, interpolation='nearest')
