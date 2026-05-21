@@ -43,7 +43,7 @@ import torch
 sys.path.insert(0, str(Path(__file__).parent))
 
 from src.datasets.gaussian_dataset import load_features_df, normalize_ct, normalize_error
-from infer_utils import SHAPE, load_config, load_raw, load_model, ddpm_sample
+from infer_utils import SHAPE, load_config, load_raw, load_model, ddpm_sample, GaussianDDPM
 
 
 # ── Raw output saving ─────────────────────────────────────────────────────────
