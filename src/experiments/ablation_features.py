@@ -221,6 +221,71 @@ def sample_ddpm(ddpm: GaussianDDPM,
     return x.squeeze(0).squeeze(0).cpu().numpy()
 
 
+# ── Reference image ───────────────────────────────────────────────────────────
+
+def generate_reference(
+    ddpm: GaussianDDPM,
+    condition: torch.Tensor,
+    feature_cols: list[str],
+    median_y: np.ndarray,
+    seed: int,
+    stride: int,
+    device: torch.device,
+    out_path: Path,
+    title: str,
+) -> tuple[np.ndarray, dict]:
+    """Generate one image at the median feature vector (no ablation).
+
+    Saves a 3-panel PNG: I_clean | Gen I_error | Gen CT.
+    Returns (gen_array, stats_dict) for CSV inclusion.
+    """
+    y_t = torch.from_numpy(median_y[None]).float().to(device)
+    gen = sample_ddpm(ddpm, condition, y_t, seed=seed, stride=stride)
+
+    # Extract I_clean from condition channel 0
+    i_clean_n = condition[0, 0].cpu().numpy()
+
+    # Gen CT (unnorm) — just for display; we don't have error_scale here so show
+    # the raw gen map with a note; users can scale by error_scale if needed
+    fig, axes = plt.subplots(1, 3, figsize=(9, 3.5))
+
+    axes[0].imshow(i_clean_n, cmap='gray', vmin=-1, vmax=1)
+    axes[0].set_title('I_clean (anchor)', fontsize=9, fontweight='bold')
+    axes[0].axis('off')
+
+    im = axes[1].imshow(gen, cmap='RdBu', vmin=-1, vmax=1)
+    axes[1].set_title('Gen I_error\n(all features at median)', fontsize=9, fontweight='bold')
+    axes[1].axis('off')
+    plt.colorbar(im, ax=axes[1], fraction=0.046, pad=0.02)
+
+    axes[2].text(0.05, 0.5, f'y (median):\n\n{chr(10).join(f"{c}: {v:.4f}" for c, v in zip(feature_cols, median_y))}',
+                 transform=axes[2].transAxes, fontsize=9, va='center', family='monospace')
+    axes[2].axis('off')
+    axes[2].set_title('Feature values', fontsize=9, fontweight='bold')
+
+    fig.suptitle(title, fontsize=9)
+    plt.tight_layout()
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_path, dpi=150, bbox_inches='tight')
+    plt.close(fig)
+    print(f'Saved: {out_path}')
+
+    pos_thr, neg_thr = 0.05, -0.05
+    stats: dict = {
+        'feature_ablated': 'reference',
+        'feature_value':   None,
+        **{fc: round(float(fv), 6) for fc, fv in zip(feature_cols, median_y)},
+        'gen_mean':     round(float(gen.mean()), 6),
+        'gen_std':      round(float(gen.std()), 6),
+        'gen_abs_mean': round(float(np.abs(gen).mean()), 6),
+        'gen_max':      round(float(gen.max()), 6),
+        'gen_min':      round(float(gen.min()), 6),
+        'gen_pos_frac': round(float((gen > pos_thr).mean()), 6),
+        'gen_neg_frac': round(float((gen < neg_thr).mean()), 6),
+    }
+    return gen, stats
+
+
 # ── Grid rendering ─────────────────────────────────────────────────────────────
 
 def render_ablation_grid(
@@ -437,6 +502,20 @@ def main() -> None:
         'feature_cols': ','.join(feature_cols),
     }
 
+    ref_path = out_path.with_name(out_path.stem + '_reference.png')
+    print('\nGenerating reference image (all features at median)...')
+    _, ref_row = generate_reference(
+        ddpm=ddpm,
+        condition=condition,
+        feature_cols=feature_cols,
+        median_y=median_y,
+        seed=args.seed,
+        stride=args.stride,
+        device=device,
+        out_path=ref_path,
+        title=f'Reference — {model_tag}  |  anchor: {args.body}/img{iid}  |  all features at median',
+    )
+
     print(f'\nGenerating {len(ablate_features)}×{args.n_steps} grid '
           f'({len(ablate_features) * args.n_steps} samples)...\n')
 
@@ -453,7 +532,7 @@ def main() -> None:
         out_path=out_path,
         title=title,
     )
-    save_ablation_csv(rows, meta, csv_path)
+    save_ablation_csv([ref_row] + rows, meta, csv_path)
 
 
 if __name__ == '__main__':
