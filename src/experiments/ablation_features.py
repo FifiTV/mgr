@@ -167,10 +167,12 @@ def generate_reference(
     title: str,
     csv_label: str = 'reference',
     y_label: str = 'y',
+    imgs_dir: Path | None = None,
 ) -> tuple[np.ndarray, dict]:
     """Generate one image for a fixed feature vector.
 
     Saves a 3-panel PNG: I_clean | Gen I_error | feature values.
+    If imgs_dir is given, also saves the raw I_error to imgs_dir/reference/<csv_label>.png.
     Returns (gen_array, row_dict) for CSV inclusion.
     """
     y_t = torch.from_numpy(y_vec[None]).float().to(device)
@@ -202,6 +204,12 @@ def generate_reference(
     plt.close(fig)
     print(f'Saved: {out_path}')
 
+    if imgs_dir is not None:
+        cell_path = imgs_dir / 'reference' / f'{csv_label}.png'
+        cell_path.parent.mkdir(parents=True, exist_ok=True)
+        plt.imsave(cell_path, gen, cmap='RdBu', vmin=-1, vmax=1)
+        print(f'Saved: {cell_path}')
+
     pos_thr, neg_thr = 0.05, -0.05
     row: dict = {
         'feature_ablated': csv_label,
@@ -232,6 +240,7 @@ def render_ablation_grid(
     device: torch.device,
     out_path: Path,
     title: str,
+    imgs_dir: Path | None = None,
 ) -> list[dict]:
     """Render and save the F × N_steps ablation grid.
 
@@ -279,6 +288,12 @@ def render_ablation_grid(
 
             if fi == 0:
                 ax.set_title(f'{val:.1f}', fontsize=8)
+
+            # ── Save individual image ──────────────────────────────────────────
+            if imgs_dir is not None:
+                cell_path = imgs_dir / feat_name / f'{val:.3f}.png'
+                cell_path.parent.mkdir(parents=True, exist_ok=True)
+                plt.imsave(cell_path, gen, cmap='RdBu', vmin=-1, vmax=1)
 
             # ── Collect stats for CSV ──────────────────────────────────────────
             pos_thr, neg_thr = 0.05, -0.05
@@ -416,6 +431,7 @@ def main() -> None:
     # ── Output path ────────────────────────────────────────────────────────────
     out_path = args.out or (results_dir / 'ablation' / f'ablation_{args.body}_img{iid}.png')
     csv_path = out_path.with_suffix('.csv')
+    imgs_dir = out_path.parent / (out_path.stem + '_imgs')
 
     model_tag = model_path.stem
     feat_tag  = ','.join(f[:4] for f in ablate_features)
@@ -448,6 +464,7 @@ def main() -> None:
         title=f'Reference (median) — {model_tag}  |  anchor: {args.body}/img{iid}',
         csv_label='reference_median',
         y_label='median',
+        imgs_dir=imgs_dir,
     )
 
     # Actual feature values for this specific image from the CSV
@@ -469,6 +486,7 @@ def main() -> None:
             title=f'Reference (actual) — {model_tag}  |  anchor: {args.body}/img{iid}',
             csv_label='reference_actual',
             y_label='actual',
+            imgs_dir=imgs_dir,
         )
         extra_rows.append(actual_row)
     else:
@@ -489,6 +507,7 @@ def main() -> None:
         device=device,
         out_path=out_path,
         title=title,
+        imgs_dir=imgs_dir,
     )
     save_ablation_csv([ref_row] + extra_rows + rows, meta, csv_path)
 
