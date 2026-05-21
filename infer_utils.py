@@ -90,37 +90,39 @@ def ddpm_sample(ddpm: GaussianDDPM,
                 seed: int | None = None) -> np.ndarray:
     """DDPM reverse sampling.
 
+    stride=1  → delegates to ddpm.sample() — identical to training visualisation,
+                 guaranteed correct.
+    stride>1  → custom loop skipping steps (faster, slightly lower quality).
+
     Args:
-        ddpm:      trained GaussianDDPM
         condition: [B, 2, H, W]  (I_clean_norm cat M_metal)
         y_target:  [B, y_dim]    feature vector in [0, 1]
-        stride:    step size — 1 = full 1000 steps, 10 ≈ 10× faster
-        seed:      if given, set both CPU and CUDA RNGs before sampling
-                   so every call with the same seed produces identical noise
+        stride:    1 = full 1000 steps; 10 ≈ 10× faster
+        seed:      if given, sets CPU + CUDA RNG before sampling
 
     Returns:
         [H, W] float32 numpy array (normalised I_error)
     """
-    B, _, H, W = condition.shape
-
     if seed is not None:
         torch.manual_seed(seed)
         if condition.device.type == 'cuda':
             torch.cuda.manual_seed(seed)
 
-    x = torch.randn(B, 1, H, W, device=condition.device)
-    T = ddpm.T
-    steps = list(reversed(range(0, T, stride)))
+    if stride == 1:
+        # Exact same path as trainer's generate_samples → guaranteed correct
+        x = ddpm.sample(condition, y_target)
+        return x.squeeze(0).squeeze(0).cpu().numpy()
 
-    for t_val in steps:
+    # Strided loop for faster (debug) sampling
+    B, _, H, W = condition.shape
+    x = torch.randn(B, 1, H, W, device=condition.device)
+    for t_val in reversed(range(0, ddpm.T, stride)):
         t_batch  = torch.full((B,), t_val, device=x.device, dtype=torch.long)
         model_in = torch.cat([x, condition], dim=1)
         eps_pred = ddpm.unet(model_in, t_batch, y_target)
-
-        beta_t  = ddpm.betas[t_val]
-        alpha_t = ddpm.alphas[t_val]
-        ab_t    = ddpm.alphas_cumprod[t_val]
-
+        beta_t   = ddpm.betas[t_val]
+        alpha_t  = ddpm.alphas[t_val]
+        ab_t     = ddpm.alphas_cumprod[t_val]
         mean = (x - beta_t / (1 - ab_t).sqrt() * eps_pred) / alpha_t.sqrt()
         x = mean + beta_t.sqrt() * torch.randn_like(x) if t_val > 0 else mean
 
