@@ -27,6 +27,7 @@ Usage:
 """
 
 import argparse
+import csv
 import re
 import sys
 from pathlib import Path
@@ -234,11 +235,15 @@ def render_ablation_grid(
     device: torch.device,
     out_path: Path,
     title: str,
-) -> None:
-    """Render and save the F × N_steps ablation grid."""
+) -> list[dict]:
+    """Render and save the F × N_steps ablation grid.
+
+    Returns a list of result dicts (one per generated cell) for CSV export.
+    """
     col_vals = np.linspace(0.0, 1.0, n_steps + 1)[1:]   # 0.1 … 1.0
     n_feats  = len(ablate_features)
     total    = n_feats * n_steps
+    rows: list[dict] = []
 
     fig, axes = plt.subplots(
         n_feats, n_steps,
@@ -278,6 +283,25 @@ def render_ablation_grid(
             if fi == 0:
                 ax.set_title(f'{val:.1f}', fontsize=8)
 
+            # ── Collect stats for CSV ──────────────────────────────────────────
+            pos_thr, neg_thr = 0.05, -0.05
+            row: dict = {
+                'feature_ablated': feat_name,
+                'feature_value':   round(float(val), 6),
+            }
+            # all feature values in this cell
+            for fc, fv in zip(feature_cols, y_vec):
+                row[fc] = round(float(fv), 6)
+            # generated output statistics
+            row['gen_mean']     = round(float(gen.mean()), 6)
+            row['gen_std']      = round(float(gen.std()), 6)
+            row['gen_abs_mean'] = round(float(np.abs(gen).mean()), 6)
+            row['gen_max']      = round(float(gen.max()), 6)
+            row['gen_min']      = round(float(gen.min()), 6)
+            row['gen_pos_frac'] = round(float((gen > pos_thr).mean()), 6)
+            row['gen_neg_frac'] = round(float((gen < neg_thr).mean()), 6)
+            rows.append(row)
+
             done += 1
             print(f'\r    {done}/{total}', end='', flush=True)
 
@@ -291,6 +315,32 @@ def render_ablation_grid(
     fig.savefig(out_path, dpi=150, bbox_inches='tight')
     plt.close(fig)
     print(f'\nSaved: {out_path}')
+    return rows
+
+
+# ── CSV export ─────────────────────────────────────────────────────────────────
+
+def save_ablation_csv(rows: list[dict], meta: dict, csv_path: Path) -> None:
+    """Write ablation results to CSV.
+
+    Each row = one generated cell. Run-level metadata (model, anchor, seed…)
+    is prepended to every row so the file is self-contained.
+    """
+    if not rows:
+        return
+    csv_path.parent.mkdir(parents=True, exist_ok=True)
+    # Column order: metadata first, then feature values, then stats
+    meta_keys  = list(meta.keys())
+    cell_keys  = [k for k in rows[0] if k not in meta_keys]
+    fieldnames = meta_keys + cell_keys
+
+    with open(csv_path, 'w', newline='', encoding='utf-8') as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({**meta, **row})
+
+    print(f'Saved: {csv_path}  ({len(rows)} rows)')
 
 
 # ── CLI ────────────────────────────────────────────────────────────────────────
@@ -368,6 +418,7 @@ def main() -> None:
 
     # ── Output path ────────────────────────────────────────────────────────────
     out_path = args.out or (results_dir / 'ablation' / f'ablation_{args.body}_img{iid}.png')
+    csv_path = out_path.with_suffix('.csv')
 
     model_tag = model_path.stem
     feat_tag  = ','.join(f[:4] for f in ablate_features)
@@ -375,10 +426,21 @@ def main() -> None:
              f'  |  seed={args.seed}  stride={args.stride}\n'
              f'features: {feat_tag}  |  other features frozen at body median')
 
+    # Run-level metadata written into every CSV row
+    meta = {
+        'model':        model_tag,
+        'anchor_body':  args.body,
+        'anchor_img_id': iid,
+        'seed':         args.seed,
+        'stride':       args.stride,
+        'n_steps':      args.n_steps,
+        'feature_cols': ','.join(feature_cols),
+    }
+
     print(f'\nGenerating {len(ablate_features)}×{args.n_steps} grid '
           f'({len(ablate_features) * args.n_steps} samples)...\n')
 
-    render_ablation_grid(
+    rows = render_ablation_grid(
         ddpm=ddpm,
         condition=condition,
         feature_cols=feature_cols,
@@ -391,6 +453,7 @@ def main() -> None:
         out_path=out_path,
         title=title,
     )
+    save_ablation_csv(rows, meta, csv_path)
 
 
 if __name__ == '__main__':
