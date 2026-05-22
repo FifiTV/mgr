@@ -387,6 +387,15 @@ def main():
             'Saved in per-sample metadata JSON.'
         )
     )
+    parser.add_argument(
+        '--start-img', type=int, default=0,
+        help=(
+            'Skip images with img_id below this value (default: 0 = start from first).\n'
+            'img_id numbering: body1=1-1000, body2=1001-2000, body3=2001-3000, …\n'
+            'Example: --start-img 500  (skip body1 imgs 1-499)\n'
+            '         --start-img 1500 (skip body2 imgs 1001-1499)'
+        )
+    )
 
     args = parser.parse_args()
 
@@ -451,6 +460,8 @@ def main():
         feat_ids = set(body_feats.index.tolist())
         pairs    = find_pairs(body_dir)
         pairs    = [p for p in pairs if p['img_id'] in feat_ids]
+        if args.start_img > 0:
+            pairs = [p for p in pairs if p['img_id'] >= args.start_img]
 
         if not pairs:
             print(f'WARNING: no matching pairs found for {body_name}.')
