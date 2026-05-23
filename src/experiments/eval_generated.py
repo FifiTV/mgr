@@ -116,7 +116,7 @@ def build_groups(samples: list[dict], rpi_dir: Path) -> tuple[list[dict], list[d
 # [1] MASKED SSIM
 # ══════════════════════════════════════════════════════════════════════════════
 
-def run_ssim(group_a: list[dict], group_b: list[dict]) -> dict:
+def run_ssim_exp(group_a: list[dict], group_b: list[dict]) -> dict:
     """[1] Masked SSIM — I_error_gen vs I_error_aapm inside the artifact mask."""
     log.info('=== [1] Masked SSIM ===')
     scores = []
@@ -184,6 +184,10 @@ def run_physical_fid(group_a: list[dict], group_b: list[dict],
     if bodies and 'source' in df_aapm.columns:
         df_aapm = df_aapm[df_aapm['source'].isin(bodies)]
     log.info(f'  Generated: {len(df_gen)}  AAPM: {len(df_aapm)}')
+
+    if len(df_gen) < 2:
+        log.warning('  [2] Skipped — fewer than 2 generated samples with matched AAPM pairs')
+        return {'Generated_vs_AAPM': None, 'n_gen': len(df_gen), 'n_aapm': len(df_aapm)}, df_gen, df_aapm
 
     fd = frechet_per_feature(df_gen, df_aapm, 'Generated', 'AAPM')
     return {'Generated_vs_AAPM': fd, 'n_gen': len(df_gen), 'n_aapm': len(df_aapm)}, df_gen, df_aapm
@@ -377,6 +381,30 @@ def _plot_ssim_histogram(ssim_result: dict, out_dir: Path):
 # MAIN
 # ══════════════════════════════════════════════════════════════════════════════
 
+RAD_IMAGENET_URL = (
+    'https://huggingface.co/BMEII-AI/RadImageNet/resolve/main/'
+    'RadImageNet-ResNet50_notop.pt'
+)
+
+
+def _ensure_rad_imagenet(path: Path) -> bool:
+    """Download RadImageNet weights if not present. Returns True if available."""
+    if path.exists():
+        return True
+    log.info(f'RadImageNet weights not found at {path} — attempting download...')
+    try:
+        import urllib.request
+        path.parent.mkdir(parents=True, exist_ok=True)
+        urllib.request.urlretrieve(RAD_IMAGENET_URL, path,
+                                   reporthook=lambda b, bs, t: None)
+        log.info(f'Downloaded RadImageNet weights → {path}')
+        return True
+    except Exception as e:
+        log.warning(f'Download failed: {e}')
+        log.warning('Run manually: wget ' + RAD_IMAGENET_URL + f' -O {path}')
+        return False
+
+
 def main():
     p = argparse.ArgumentParser(
         description='Evaluation of generated CT data quality',
@@ -398,14 +426,35 @@ def main():
                    help='Body variants to include (e.g. --bodies body8). '
                         'Default: all bodies found in --generated.')
     p.add_argument('--rad-imagenet', type=Path, default=None,
-                   help='RadImageNet-ResNet50_notop.pt weights — required for [3] variant 2 and [4]')
+                   help='RadImageNet-ResNet50_notop.pt weights. '
+                        'If the file is missing it will be downloaded automatically.')
+    # Coarse experiment groups (kept for backward compatibility)
     p.add_argument('--ssim-only',    action='store_true', help='Run only experiment [1]')
     p.add_argument('--fid-only',     action='store_true', help='Run only experiments [2][3][4]')
-    p.add_argument('--skip-med-fid', action='store_true',
-                   help='Skip [4] Med-FID (use when RadImageNet weights are unavailable)')
+    # Per-experiment skip flags
+    p.add_argument('--skip-ssim',         action='store_true', help='Skip [1] Masked SSIM')
+    p.add_argument('--skip-physical-fid', action='store_true', help='Skip [2] Physical FID')
+    p.add_argument('--skip-sinogram-fid', action='store_true', help='Skip [3] Sinogram FID')
+    p.add_argument('--skip-med-fid',      action='store_true',
+                   help='Skip [4] Med-FID (implied when --rad-imagenet is absent and download fails)')
     args = p.parse_args()
 
     args.out.mkdir(parents=True, exist_ok=True)
+
+    # ── Resolve experiment flags ──────────────────────────────────────────────
+    run_ssim    = not args.fid_only  and not args.skip_ssim
+    run_phys    = not args.ssim_only and not args.skip_physical_fid
+    run_sino    = not args.ssim_only and not args.skip_sinogram_fid
+    run_med     = not args.ssim_only and not args.skip_med_fid
+
+    # ── Ensure RadImageNet weights ────────────────────────────────────────────
+    if run_med or (run_sino and args.rad_imagenet is not None):
+        if args.rad_imagenet is None:
+            log.warning('--rad-imagenet not specified; [3] RadIN variant and [4] Med-FID will be skipped')
+            run_med = False
+        elif not _ensure_rad_imagenet(args.rad_imagenet):
+            log.warning('RadImageNet weights unavailable; [3] RadIN variant and [4] Med-FID skipped')
+            run_med = False
 
     # ── Load data ────────────────────────────────────────────────────────────
     samples  = load_generated_samples(args.generated, bodies=args.bodies)
@@ -416,6 +465,11 @@ def main():
         clip_stats = json.load(f)
 
     group_a, group_b = build_groups(samples, args.rpi)
+
+    if len(group_a) == 0:
+        log.warning('No generated/AAPM pairs found — experiments requiring paired data will be skipped')
+        run_ssim = False
+        run_phys = False
 
     # ── Session metadata ─────────────────────────────────────────────────────
     run_meta = {
@@ -434,8 +488,8 @@ def main():
     results = {}
 
     # ── [1] Masked SSIM ──────────────────────────────────────────────────────
-    if not args.fid_only:
-        results['ssim'] = run_ssim(group_a, group_b)
+    if run_ssim:
+        results['ssim'] = run_ssim_exp(group_a, group_b)
         with open(args.out / 'ssim_scores.json', 'w') as f:
             json.dump(results['ssim'], f, indent=2)
         if results['ssim']['scores']:
@@ -447,61 +501,64 @@ def main():
             summary['masked_ssim_mean'] = results['ssim']['mean']
             summary['masked_ssim_std']  = results['ssim']['std']
             summary['masked_ssim_n']    = results['ssim']['n']
+    else:
+        log.info('[1] Masked SSIM skipped')
 
     # ── [2] Physical FID ─────────────────────────────────────────────────────
-    if not args.ssim_only:
+    if run_phys:
         fid_result, df_gen, df_aapm = run_physical_fid(
             group_a, group_b, args.features, clip_stats, bodies=bodies,
         )
         results['physical_fid'] = fid_result
         with open(args.out / 'physical_fid.json', 'w') as f:
             json.dump(fid_result, f, indent=2)
-        save_fid_csv({'Generated_vs_AAPM': fid_result['Generated_vs_AAPM']},
-                     args.out / 'physical_fid.csv')
 
-        df_gen_out  = df_gen[FEATURE_COLS].copy();  df_gen_out['dataset']  = 'Generated'
-        df_aapm_out = df_aapm[FEATURE_COLS].copy(); df_aapm_out['dataset'] = 'AAPM'
-        pd.concat([df_gen_out, df_aapm_out], ignore_index=True).to_csv(
-            args.out / 'features_gen_vs_aapm.csv', index=False)
-        log.info(f'CSV → {args.out / "features_gen_vs_aapm.csv"}')
+        if fid_result.get('Generated_vs_AAPM'):
+            save_fid_csv({'Generated_vs_AAPM': fid_result['Generated_vs_AAPM']},
+                         args.out / 'physical_fid.csv')
 
-        _plot_distributions(df_gen, df_aapm, args.out)
+        if not df_gen.empty and FEATURE_COLS[0] in df_gen.columns:
+            df_gen_out  = df_gen[FEATURE_COLS].copy();  df_gen_out['dataset']  = 'Generated'
+            df_aapm_out = df_aapm[FEATURE_COLS].copy(); df_aapm_out['dataset'] = 'AAPM'
+            pd.concat([df_gen_out, df_aapm_out], ignore_index=True).to_csv(
+                args.out / 'features_gen_vs_aapm.csv', index=False)
+            log.info(f'CSV → {args.out / "features_gen_vs_aapm.csv"}')
+            _plot_distributions(df_gen, df_aapm, args.out)
+
         summary['phys_fd_Generated_vs_AAPM'] = (
-            fid_result.get('Generated_vs_AAPM', {}).get('combined_6D'))
+            (fid_result.get('Generated_vs_AAPM') or {}).get('combined_6D'))
+    else:
+        log.info('[2] Physical FID skipped')
 
     # ── [3] Sinogram FID ─────────────────────────────────────────────────────
-    if not args.ssim_only:
-        results['sinogram_fid'] = run_sinogram_fid(
-            group_a, group_b, hospital,
-            rad_imagenet_path=args.rad_imagenet,
-        )
-        with open(args.out / 'sinogram_fid.json', 'w') as f:
-            json.dump(results['sinogram_fid'], f, indent=2)
+    if run_sino:
+        if len(group_a) == 0 and len(hospital) == 0:
+            log.warning('[3] Sinogram FID skipped — no paired data and no hospital images')
+        else:
+            results['sinogram_fid'] = run_sinogram_fid(
+                group_a, group_b, hospital,
+                rad_imagenet_path=args.rad_imagenet if run_med else None,
+            )
+            with open(args.out / 'sinogram_fid.json', 'w') as f:
+                json.dump(results['sinogram_fid'], f, indent=2)
 
-        sino_rows = [{'comparison': k, 'frechet_distance': v}
-                     for k, v in results['sinogram_fid'].items()
-                     if isinstance(v, float)]
-        if sino_rows:
-            pd.DataFrame(sino_rows).to_csv(args.out / 'sinogram_fid.csv', index=False)
-            log.info(f'CSV → {args.out / "sinogram_fid.csv"}')
+            sino_rows = [{'comparison': k, 'frechet_distance': v}
+                         for k, v in results['sinogram_fid'].items()
+                         if isinstance(v, float)]
+            if sino_rows:
+                pd.DataFrame(sino_rows).to_csv(args.out / 'sinogram_fid.csv', index=False)
+                log.info(f'CSV → {args.out / "sinogram_fid.csv"}')
 
-        for cmp in ['stats_Generated(A)_vs_AAPM(B)',
-                    'stats_Generated(A)_vs_Hospital(C)',
-                    'stats_AAPM(B)_vs_Hospital(C)']:
-            val = results['sinogram_fid'].get(cmp)
-            if isinstance(val, float):
-                summary[f'sino_{cmp}'] = val
+            for cmp in ['stats_Generated(A)_vs_AAPM(B)',
+                        'stats_Generated(A)_vs_Hospital(C)',
+                        'stats_AAPM(B)_vs_Hospital(C)']:
+                val = results['sinogram_fid'].get(cmp)
+                if isinstance(val, float):
+                    summary[f'sino_{cmp}'] = val
+    else:
+        log.info('[3] Sinogram FID skipped')
 
     # ── [4] Med-FID ──────────────────────────────────────────────────────────
-    rad_ok = (args.rad_imagenet is not None and args.rad_imagenet.exists())
-    run_med = not args.ssim_only and not args.skip_med_fid and rad_ok
-
-    if not args.ssim_only and not args.skip_med_fid:
-        if args.rad_imagenet is None:
-            log.warning('[4] Med-FID skipped — provide --rad-imagenet <path> to enable')
-        elif not args.rad_imagenet.exists():
-            log.warning(f'[4] Med-FID skipped — file not found: {args.rad_imagenet}')
-
     if run_med:
         results['med_fid'] = run_med_fid(group_a, group_b, hospital, args.rad_imagenet)
         with open(args.out / 'med_fid.json', 'w') as f:
@@ -520,6 +577,8 @@ def main():
             val = results['med_fid'].get(cmp)
             if isinstance(val, float):
                 summary[f'med_fid_{cmp}'] = val
+    else:
+        log.info('[4] Med-FID skipped')
 
     # ── Summary ──────────────────────────────────────────────────────────────
     with open(args.out / 'summary.json', 'w') as f:
