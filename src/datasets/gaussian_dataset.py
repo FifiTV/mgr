@@ -7,8 +7,11 @@ with a precomputed, normalized feature vector y from a CSV file.
 Normalization:
     I_clean, I_metal : clip to [-1000, 3000] HU -> scale to [-1, 1]
     I_error          : clip to [-3000,  3000] HU -> scale to [-1, 1]  (divide by 3000)
-    M_metal          : binary mask [0, 1] loaded from Metal/ directory
-                       Falls back to threshold on |I_metal - I_clean| if Metal/ missing.
+    M_metal          : distance-transform influence field [0, 1] derived from the binary
+                       metal mask (Metal/ directory) or HU-threshold fallback.
+                       Value = max(0, 1 - dist_to_metal / 200px): 1.0 at implant,
+                       decaying linearly to 0 at ≥200 px away.  Survives 4× downsampling
+                       (32×32 bottleneck) where a binary mask would vanish.
 
 Random metal augmentation:
     With probability p_random_metal, M_metal for sample i is replaced by a random
@@ -33,6 +36,7 @@ from typing import List, Optional, Union
 import numpy as np
 import pandas as pd
 import torch
+from scipy.ndimage import distance_transform_edt
 from torch.utils.data import Dataset
 
 logger = logging.getLogger(__name__)
@@ -191,6 +195,7 @@ class GaussianDataset(Dataset):
                  features_df: pd.DataFrame,
                  p_random_metal: float = 0.5,
                  metal_threshold_hu: float = METAL_THRESHOLD_HU,
+                 metal_dt_radius: float = 200.0,
                  error_scale: float = 642.8,
                  preload: bool = False,
                  feature_cols: Optional[List[str]] = None):
@@ -209,6 +214,7 @@ class GaussianDataset(Dataset):
         """
         self.p_random_metal      = p_random_metal
         self.metal_threshold_hu  = metal_threshold_hu
+        self.metal_dt_radius     = metal_dt_radius
         self.error_scale         = error_scale
         self.feature_cols        = list(feature_cols) if feature_cols else FEATURE_COLS
         self._cache: Optional[dict] = {} if preload else None
@@ -281,21 +287,25 @@ class GaussianDataset(Dataset):
         return np.fromfile(path, dtype=np.float32).reshape(SHAPE)
 
     def _get_metal_mask(self, record: dict) -> np.ndarray:
-        """Return binary metal mask exactly as stored in Metal/ files (no dilation).
+        """Return distance-transform influence field for the metal mask.
 
-        The model learns streak locations from I_error during training.
-        The mask only needs to mark the implant source, not its artifact extent.
+        Converts the binary mask to a soft field: 1.0 at implant pixels, decaying
+        linearly to 0 at ≥200 px distance.  This survives 4× downsampling — at the
+        32×32 U-Net bottleneck a binary ~170-px mask would occupy <1 pixel.
 
         Fallback (Metal/ absent): threshold |I_art - I_clean| at 2500 HU,
         which isolates the implant itself (above bloom range ~2040 HU).
         """
         if record['metal_path'] is not None:
-            mask = self._load_raw(record['metal_path'])
-            return (mask > 0.5).astype(np.float32)
+            raw    = self._load_raw(record['metal_path'])
+            binary = (raw > 0.5).astype(bool)
+        else:
+            i_art   = self._load_raw(record['art_path'])
+            i_clean = self._load_raw(record['clean_path'])
+            binary  = np.abs(i_art - i_clean) > self.metal_threshold_hu
 
-        i_art   = self._load_raw(record['art_path'])
-        i_clean = self._load_raw(record['clean_path'])
-        return (np.abs(i_art - i_clean) > self.metal_threshold_hu).astype(np.float32)
+        dist = distance_transform_edt(~binary)
+        return np.clip(1.0 - dist / self.metal_dt_radius, 0.0, 1.0).astype(np.float32)
 
     def __getitem__(self, idx: int) -> dict:
         rec     = self._records[idx]

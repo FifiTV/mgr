@@ -101,9 +101,11 @@ ema_decay       = 0.9999
 base_channels   = 64
 t_emb_dim       = 256
 attn_heads      = 8
-sample_interval      = 1     # generate visual samples every N epochs (0 = disabled)
+sample_interval      = 5     # generate visual samples every N epochs (0 = disabled)
 metal_threshold_hu   = 500   # fallback mask threshold when Metal/ dir is absent; 500 HU catches implant bloom
-error_scale          = 318.8 # global P50 of per-image P99.5 of |I_error|, computed on full RPI training set (12374 images)
+metal_dt_radius      = 200   # distance-transform influence radius in pixels; 1.0 at implant, 0.0 at >=radius px
+# error_scale          = 318.8 # global P50 of per-image P99.5 of |I_error|, computed on full RPI training set (12374 images)
+error_scale          = 642.8 # P75 of per-image P99.5 of |I_error| (12374 images); clip(-scale,scale)/scale -> exactly [-1,1]
 feature_cols    = ["peak_amplitude", "spatial_extent", "bbox_ratio",
                    "dark_to_bright_ratio", "angular_concentration",
                    "texture_roughness"]  # add "tau" to include it
@@ -120,7 +122,8 @@ label_mode = "soft"  # "soft" or "hard"
 # Leave all empty [] to fall back to legacy single-variant mode (body1).
 # train = ["body1", "body2", "body3", "body4", "body5", "body6"]
 train = ["body1", "body2", "body3", "body4", "body5", "body6"]
-val   = ["body7"]
+val   = ["body1"]
+# val   = ["body7"]
 test  = ["body9"]
 
 # Real image filter: parse the number after "metal" in filenames
