@@ -175,10 +175,16 @@ def radimagenet_features(images: list[np.ndarray], weights_path: Path,
     device = (torch.device('cuda' if torch.cuda.is_available() else 'cpu')
               if device_str == 'auto' else torch.device(device_str))
 
-    backbone = tv_models.resnet50()
-    state = torch.load(weights_path, map_location='cpu', weights_only=True)
-    backbone.load_state_dict(state, strict=False)
-    backbone.fc = torch.nn.Identity()
+    obj = torch.load(weights_path, map_location='cpu', weights_only=False)
+    if isinstance(obj, torch.nn.Module):
+        # Full model saved with torch.save(model, ...) — Lab-Rasool/RadImageNet format
+        backbone = obj
+    else:
+        # State dict — load into a fresh ResNet50
+        backbone = tv_models.resnet50()
+        backbone.load_state_dict(obj, strict=False)
+    if hasattr(backbone, 'fc'):
+        backbone.fc = torch.nn.Identity()
     backbone.eval().to(device)
 
     mean = torch.tensor([0.485, 0.456, 0.406], device=device).view(1, 3, 1, 1)

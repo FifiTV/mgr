@@ -382,8 +382,7 @@ def _plot_ssim_histogram(ssim_result: dict, out_dir: Path):
 # ══════════════════════════════════════════════════════════════════════════════
 
 RAD_IMAGENET_URL = (
-    'https://huggingface.co/BMEII-AI/RadImageNet/resolve/main/'
-    'RadImageNet-ResNet50_notop.pt'
+    'https://huggingface.co/Lab-Rasool/RadImageNet/resolve/main/ResNet50.pt'
 )
 
 
