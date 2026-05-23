@@ -385,6 +385,8 @@ def main():
                             "noised to this level instead of pure Gaussian noise.\n"
                             "Recommended: 600-800. Use when generation produces noise."
                         ))
+    parser.add_argument("--no-diffusion", action="store_true",
+                        help="Skip Diffusion model even if weights are found at the default path.")
     parser.add_argument("--no-masks",   action="store_true",
                         help=(
                             "Zero out mask inputs for G_AB and Diffusion.\n"
@@ -422,7 +424,9 @@ def main():
     else:
         print(f"G_BA not found:     {path_ba}")
 
-    if path_diff.exists():
+    if args.no_diffusion:
+        print("Diffusion skipped (--no-diffusion)")
+    elif path_diff.exists():
         print(f"Loading Diffusion:  {path_diff}")
         diff_model = load_diffusion(path_diff, cfg, device)
     else:

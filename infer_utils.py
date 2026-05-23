@@ -36,6 +36,9 @@ def load_model(model_path: Path, cfg: dict,
     """Load GaussianDDPM from checkpoint, preferring EMA weights.
 
     Returns (ddpm, feature_cols).
+    Handles both:
+      - flat EMA dict  {param_name: tensor}         (gaussian_unet_ema.pth)
+      - checkpoint     {epoch, model_state, ema_state, ...}  (checkpoint.pth)
     """
     gaus = cfg.get('gaussian', {})
     feature_cols = gaus.get('feature_cols', None) or FEATURE_COLS
@@ -63,20 +66,50 @@ def load_model(model_path: Path, cfg: dict,
     )
     if '_ema' not in model_path.stem and ema_path.exists():
         load_path = ema_path
-        print(f'  Using EMA weights: {load_path}')
+        print(f'  EMA weights: {load_path}')
     else:
         load_path = model_path
 
-    state = torch.load(load_path, map_location=device, weights_only=True)
-    # EMA checkpoint stores tensors on CPU regardless of map_location
-    state = {k: v.to(device) for k, v in state.items()}
-    # Raw-weight checkpoint wraps keys under 'model_state'
-    if 'model_state' in state:
-        state = state['model_state']
-    unet.load_state_dict(state)
+    # Load to CPU first to avoid device mismatches
+    raw = torch.load(load_path, map_location='cpu', weights_only=False)
+
+    # --- Unwrap checkpoint format -----------------------------------------
+    # Checkpoint:  {'epoch': int, 'model_state': {...}, 'ema_state': {...}}
+    # EMA file:    {'param_name': tensor, ...}  (flat)
+    # Raw file:    {'param_name': tensor, ...}  (flat)
+    if isinstance(raw, dict) and not any(isinstance(v, torch.Tensor) for v in list(raw.values())[:3]):
+        # Top-level values are not tensors → checkpoint wrapper
+        epoch = raw.get('epoch', '?')
+        if 'ema_state' in raw:
+            state = raw['ema_state']
+            print(f'  Checkpoint (epoch={epoch}) → using ema_state')
+        elif 'model_state' in raw:
+            state = raw['model_state']
+            print(f'  Checkpoint (epoch={epoch}) → using model_state')
+        else:
+            state = raw
+            print(f'  Checkpoint (epoch={epoch}) → unknown format, using top-level keys')
+    else:
+        state = raw
+
+    # Keep only tensors (skip stray scalars or metadata)
+    state = {k: v.to(device) for k, v in state.items() if isinstance(v, torch.Tensor)}
+
+    unet.load_state_dict(state, strict=True)
     ddpm = ddpm.to(device)
     ddpm.eval()
-    print(f'  Loaded: {load_path}  (y_dim={y_dim}, features={feature_cols})')
+
+    # --- Sanity diagnostics -----------------------------------------------
+    with torch.no_grad():
+        w = unet.enc_proj.weight  # [64, 3, 3, 3]
+        w_norm = w.abs().mean().item()
+        # kaiming_uniform for Conv2d(3→64, k=3): fan_in=27, E[|w|]=1/(2√27)≈0.096
+        # A trained model typically deviates significantly from init range
+        trained_hint = 'OK' if w_norm > 0.05 else 'WARN – may be random init!'
+    print(f'  Loaded: {load_path.name}  '
+          f'params={sum(p.numel() for p in unet.parameters())//1000}k  '
+          f'enc_proj |w|_mean={w_norm:.4f}  [{trained_hint}]')
+    print(f'  y_dim={y_dim}  features={feature_cols}')
     return ddpm, feature_cols
 
 
