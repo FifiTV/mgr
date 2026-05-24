@@ -204,6 +204,39 @@ def radimagenet_features(images: list[np.ndarray], weights_path: Path,
     return np.array(feats, dtype=np.float32)
 
 
+def imagenet_features(images: list[np.ndarray],
+                      device_str: str = 'auto') -> np.ndarray:
+    """Extract 2048D features from ResNet50 pretrained on ImageNet.
+
+    Standard FID baseline — compare against Med-FID (RadImageNet).
+    Normalization: HU clip [-1000, 3000] → [0, 1] (fixed window, not per-image).
+    """
+    import torch
+    import torchvision.models as tv_models
+
+    device = (torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+              if device_str == 'auto' else torch.device(device_str))
+
+    backbone = tv_models.resnet50(weights=tv_models.ResNet50_Weights.IMAGENET1K_V1)
+    backbone.fc = torch.nn.Identity()
+    backbone.eval().to(device)
+
+    mean = torch.tensor([0.485, 0.456, 0.406], device=device).view(1, 3, 1, 1)
+    std  = torch.tensor([0.229, 0.224, 0.225], device=device).view(1, 3, 1, 1)
+
+    feats = []
+    for img in images:
+        # Fixed HU window [-1000, 3000] → [0, 1] (same for all images, unlike per-image min/max)
+        img_norm = (np.clip(img, -1000.0, 3000.0) + 1000.0) / 4000.0
+        img_r = resize(img_norm, (224, 224), anti_aliasing=True)
+        t = torch.from_numpy(img_r).float().unsqueeze(0).repeat(3, 1, 1).unsqueeze(0)
+        t = (t.to(device) - mean) / std
+        with torch.no_grad():
+            feats.append(backbone(t).squeeze().cpu().numpy())
+
+    return np.array(feats, dtype=np.float32)
+
+
 def sinogram_images(images: list[np.ndarray]) -> list[np.ndarray]:
     """Przelicz listę obrazów CT na sinogramy (do podania do radimagenet_features)."""
     return [radon(img.astype(np.float64), theta=RADON_THETA, circle=True).astype(np.float32)
