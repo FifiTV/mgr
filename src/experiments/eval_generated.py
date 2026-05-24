@@ -43,7 +43,7 @@ sys.path.insert(0, str(_ROOT))
 
 from src.experiments.eval_utils import (
     FEATURE_COLS, find_aapm_pair, frechet_distance, frechet_per_feature,
-    load_generated_samples, load_hospital_images, load_raw,
+    imagenet_features, load_generated_samples, load_hospital_images, load_raw,
     normalize_features, radimagenet_features, save_fid_csv,
     sinogram_images, sinogram_stat_features,
 )
@@ -436,6 +436,8 @@ def main():
     p.add_argument('--skip-sinogram-fid', action='store_true', help='Skip [3] Sinogram FID')
     p.add_argument('--skip-med-fid',      action='store_true',
                    help='Skip [4] Med-FID (implied when --rad-imagenet is absent and download fails)')
+    p.add_argument('--skip-standard-fid', action='store_true',
+                   help='Skip [5] Standard FID (ImageNet ResNet50)')
     args = p.parse_args()
 
     args.out.mkdir(parents=True, exist_ok=True)
@@ -445,6 +447,7 @@ def main():
     run_phys    = not args.ssim_only and not args.skip_physical_fid
     run_sino    = not args.ssim_only and not args.skip_sinogram_fid
     run_med     = not args.ssim_only and not args.skip_med_fid
+    run_std_fid = not args.ssim_only and not args.skip_standard_fid
 
     # ── Ensure RadImageNet weights ────────────────────────────────────────────
     if run_med or (run_sino and args.rad_imagenet is not None):
@@ -578,6 +581,54 @@ def main():
                 summary[f'med_fid_{cmp}'] = val
     else:
         log.info('[4] Med-FID skipped')
+
+    # ── [5] Standard FID — ImageNet ResNet50 ─────────────────────────────────
+    if run_std_fid:
+        if len(group_a) == 0 and len(hospital) == 0:
+            log.warning('[5] Standard FID skipped — no data')
+        else:
+            log.info('=== [5] Standard FID (ImageNet ResNet50) ===')
+            imgs_a = [a['I_sino'] for a in group_a]
+            imgs_b = [b['I_sino'] for b in group_b]
+            imgs_c = [np.clip(img, HU_LO, HU_HI).astype(np.float32) for _, img in hospital]
+
+            rf_a = imagenet_features(imgs_a) if imgs_a else np.empty((0, 2048))
+            rf_b = imagenet_features(imgs_b) if imgs_b else np.empty((0, 2048))
+            rf_c = imagenet_features(imgs_c) if imgs_c else np.empty((0, 2048))
+
+            log.info(f'  Features: A{rf_a.shape}  B{rf_b.shape}  C{rf_c.shape}')
+
+            std_fid = {'method': 'ImageNet_ResNet50_2048D'}
+            for fa, fb, la, lb in [
+                (rf_a, rf_b, 'Generated(A)', 'AAPM(B)'),
+                (rf_a, rf_c, 'Generated(A)', 'Hospital(C)'),
+                (rf_b, rf_c, 'AAPM(B)',      'Hospital(C)'),
+            ]:
+                key = f'{la}_vs_{lb}'
+                if fa.shape[0] >= 2 and fb.shape[0] >= 2:
+                    std_fid[key] = frechet_distance(fa, fb)
+                    log.info(f'  Std-FID({la} vs {lb}) = {std_fid[key]:.4f}')
+                else:
+                    std_fid[key] = None
+
+            results['standard_fid'] = std_fid
+            with open(args.out / 'standard_fid.json', 'w') as f:
+                json.dump(std_fid, f, indent=2)
+
+            std_rows = [{'comparison': k, 'frechet_distance': v}
+                        for k, v in std_fid.items() if isinstance(v, float)]
+            if std_rows:
+                pd.DataFrame(std_rows).to_csv(args.out / 'standard_fid.csv', index=False)
+                log.info(f'CSV → {args.out / "standard_fid.csv"}')
+
+            for cmp in ['Generated(A)_vs_AAPM(B)',
+                        'Generated(A)_vs_Hospital(C)',
+                        'AAPM(B)_vs_Hospital(C)']:
+                val = std_fid.get(cmp)
+                if isinstance(val, float):
+                    summary[f'std_fid_{cmp}'] = val
+    else:
+        log.info('[5] Standard FID skipped')
 
     # ── Summary ──────────────────────────────────────────────────────────────
     with open(args.out / 'summary.json', 'w') as f:
