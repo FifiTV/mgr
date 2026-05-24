@@ -396,6 +396,14 @@ def main():
             '         --start-img 1500 (skip body2 imgs 1001-1499)'
         )
     )
+    parser.add_argument(
+        '--feature-cols', nargs='+', default=None, metavar='COL',
+        help=(
+            'Feature columns to use (overrides config and checkpoint auto-detection).\n'
+            'Use for ablation models trained with a feature subset, e.g.:\n'
+            '  --feature-cols peak_amplitude spatial_extent bbox_ratio'
+        )
+    )
 
     args = parser.parse_args()
 
@@ -433,6 +441,14 @@ def main():
     # ── Load model and features ────────────────────────────────────────────────
     print(f'Loading model: {model_path}')
     ddpm, feature_cols = load_model(model_path, cfg, device)
+
+    # --feature-cols overrides auto-detected feature_cols (use for ablation models)
+    if args.feature_cols:
+        if len(args.feature_cols) != len(feature_cols):
+            sys.exit(f'--feature-cols has {len(args.feature_cols)} entries but checkpoint '
+                     f'y_dim={len(feature_cols)}. Must match.')
+        feature_cols = args.feature_cols
+        print(f'  feature_cols overridden: {feature_cols}')
 
     print(f'Loading features: {features_path}')
     features_df = load_features_df(features_path)

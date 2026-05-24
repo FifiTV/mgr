@@ -42,7 +42,33 @@ def load_model(model_path: Path, cfg: dict,
     """
     gaus = cfg.get('gaussian', {})
     feature_cols = gaus.get('feature_cols', None) or FEATURE_COLS
-    y_dim = len(feature_cols)
+
+    # Detect y_dim from checkpoint before building the model — handles ablation
+    # models trained with fewer features (e.g. 3 instead of 6).
+    _probe_path = model_path
+    _probe_ema  = model_path.parent / (
+        model_path.stem.replace('_ema', '').replace('gaussian_unet', 'gaussian_unet_ema')
+        + model_path.suffix
+    )
+    if '_ema' not in model_path.stem and _probe_ema.exists():
+        _probe_path = _probe_ema
+    _raw_probe = torch.load(_probe_path, map_location='cpu', weights_only=False)
+    if isinstance(_raw_probe, dict) and not any(isinstance(v, torch.Tensor) for v in list(_raw_probe.values())[:3]):
+        _state_probe = _raw_probe.get('ema_state') or _raw_probe.get('model_state') or _raw_probe
+    else:
+        _state_probe = _raw_probe
+    _ypw = next((v for k, v in _state_probe.items()
+                 if isinstance(v, torch.Tensor) and 'y_proj.0.weight' in k), None)
+    if _ypw is not None:
+        y_dim_ckpt = _ypw.shape[1]
+        if y_dim_ckpt != len(feature_cols):
+            print(f'  WARNING: checkpoint y_dim={y_dim_ckpt} != config feature_cols={len(feature_cols)}. '
+                  f'Using checkpoint value.')
+        y_dim = y_dim_ckpt
+        # Truncate or pad feature_cols list to match checkpoint
+        feature_cols = feature_cols[:y_dim]
+    else:
+        y_dim = len(feature_cols)
 
     unet = GaussianUNet(
         in_ch=3, out_ch=1,
