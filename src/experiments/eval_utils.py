@@ -205,11 +205,15 @@ def radimagenet_features(images: list[np.ndarray], weights_path: Path,
 
 
 def imagenet_features(images: list[np.ndarray],
+                      weights_path: Path | None = None,
                       device_str: str = 'auto') -> np.ndarray:
     """Extract 2048D features from ResNet50 pretrained on ImageNet.
 
     Standard FID baseline — compare against Med-FID (RadImageNet).
     Normalization: HU clip [-1000, 3000] → [0, 1] (fixed window, not per-image).
+
+    weights_path: optional local .pth file. If None, torchvision downloads automatically
+                  to ~/.cache/torch/hub/checkpoints/ (requires internet on first run).
     """
     import torch
     import torchvision.models as tv_models
@@ -217,7 +221,15 @@ def imagenet_features(images: list[np.ndarray],
     device = (torch.device('cuda' if torch.cuda.is_available() else 'cpu')
               if device_str == 'auto' else torch.device(device_str))
 
-    backbone = tv_models.resnet50(weights=tv_models.ResNet50_Weights.IMAGENET1K_V1)
+    backbone = tv_models.resnet50()
+    if weights_path is not None and Path(weights_path).exists():
+        state = torch.load(weights_path, map_location='cpu', weights_only=True)
+        backbone.load_state_dict(state)
+        log.info(f'ImageNet weights loaded from {weights_path}')
+    else:
+        # Automatic download via torchvision (cached in ~/.cache/torch/hub/checkpoints/)
+        backbone = tv_models.resnet50(weights=tv_models.ResNet50_Weights.IMAGENET1K_V1)
+        log.info('ImageNet weights loaded from torchvision cache')
     backbone.fc = torch.nn.Identity()
     backbone.eval().to(device)
 

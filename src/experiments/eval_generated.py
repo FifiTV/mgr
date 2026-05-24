@@ -384,24 +384,41 @@ def _plot_ssim_histogram(ssim_result: dict, out_dir: Path):
 RAD_IMAGENET_URL = (
     'https://huggingface.co/Lab-Rasool/RadImageNet/resolve/main/ResNet50.pt'
 )
+# torchvision ResNet50 ImageNet weights (IMAGENET1K_V1)
+IMAGENET_URL = (
+    'https://download.pytorch.org/models/resnet50-0676ba61.pth'
+)
 
 
-def _ensure_rad_imagenet(path: Path) -> bool:
-    """Download RadImageNet weights if not present. Returns True if available."""
+def _download_weights(url: str, path: Path, label: str) -> bool:
+    """Download model weights to path. Returns True if available after call."""
     if path.exists():
         return True
-    log.info(f'RadImageNet weights not found at {path} — attempting download...')
+    log.info(f'{label} weights not found at {path} — attempting download...')
     try:
         import urllib.request
         path.parent.mkdir(parents=True, exist_ok=True)
-        urllib.request.urlretrieve(RAD_IMAGENET_URL, path,
-                                   reporthook=lambda b, bs, t: None)
-        log.info(f'Downloaded RadImageNet weights → {path}')
+        urllib.request.urlretrieve(url, path, reporthook=lambda b, bs, t: None)
+        log.info(f'Downloaded {label} weights → {path}')
         return True
     except Exception as e:
         log.warning(f'Download failed: {e}')
-        log.warning('Run manually: wget ' + RAD_IMAGENET_URL + f' -O {path}')
+        log.warning(f'Run manually:  wget {url} -O {path}')
         return False
+
+
+def _ensure_rad_imagenet(path: Path) -> bool:
+    return _download_weights(RAD_IMAGENET_URL, path, 'RadImageNet')
+
+
+def _ensure_imagenet(path: Path | None) -> Path | None:
+    """Return path to ImageNet weights (download if needed), or None for auto-cache."""
+    if path is None:
+        log.info('--imagenet not set; torchvision will use its cache '
+                 '(~/.cache/torch/hub/checkpoints/) — requires internet on first run')
+        return None
+    _download_weights(IMAGENET_URL, path, 'ImageNet ResNet50')
+    return path if path.exists() else None
 
 
 def main():
@@ -425,8 +442,12 @@ def main():
                    help='Body variants to include (e.g. --bodies body8). '
                         'Default: all bodies found in --generated.')
     p.add_argument('--rad-imagenet', type=Path, default=None,
-                   help='RadImageNet-ResNet50_notop.pt weights. '
-                        'If the file is missing it will be downloaded automatically.')
+                   help='RadImageNet ResNet50 weights (.pt). '
+                        'If missing, downloaded from HuggingFace (Lab-Rasool/RadImageNet).')
+    p.add_argument('--imagenet',     type=Path, default=None,
+                   help='ImageNet ResNet50 weights (.pth) for [5] Standard FID. '
+                        'If missing, downloaded from pytorch.org. '
+                        'If not set, torchvision uses ~/.cache/torch/hub/checkpoints/.')
     # Coarse experiment groups (kept for backward compatibility)
     p.add_argument('--ssim-only',    action='store_true', help='Run only experiment [1]')
     p.add_argument('--fid-only',     action='store_true', help='Run only experiments [2][3][4]')
@@ -448,6 +469,9 @@ def main():
     run_sino    = not args.ssim_only and not args.skip_sinogram_fid
     run_med     = not args.ssim_only and not args.skip_med_fid
     run_std_fid = not args.ssim_only and not args.skip_standard_fid
+
+    # ── Ensure ImageNet weights (Standard FID) ───────────────────────────────
+    imagenet_weights = _ensure_imagenet(args.imagenet) if run_std_fid else None
 
     # ── Ensure RadImageNet weights ────────────────────────────────────────────
     if run_med or (run_sino and args.rad_imagenet is not None):
@@ -592,9 +616,9 @@ def main():
             imgs_b = [b['I_sino'] for b in group_b]
             imgs_c = [np.clip(img, HU_LO, HU_HI).astype(np.float32) for _, img in hospital]
 
-            rf_a = imagenet_features(imgs_a) if imgs_a else np.empty((0, 2048))
-            rf_b = imagenet_features(imgs_b) if imgs_b else np.empty((0, 2048))
-            rf_c = imagenet_features(imgs_c) if imgs_c else np.empty((0, 2048))
+            rf_a = imagenet_features(imgs_a, imagenet_weights) if imgs_a else np.empty((0, 2048))
+            rf_b = imagenet_features(imgs_b, imagenet_weights) if imgs_b else np.empty((0, 2048))
+            rf_c = imagenet_features(imgs_c, imagenet_weights) if imgs_c else np.empty((0, 2048))
 
             log.info(f'  Features: A{rf_a.shape}  B{rf_b.shape}  C{rf_c.shape}')
 
