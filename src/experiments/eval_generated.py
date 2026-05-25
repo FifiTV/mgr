@@ -14,7 +14,7 @@ Experiments:
 
 Usage:
   python3 eval_generated.py \\
-    --generated data/raw/generated \\
+    --generated data/raw/generated/body8/raw data/raw/generated/body9/raw \\
     --rpi       data/raw/RPI \\
     --real      data/raw/real \\
     --features  results/features_norm.csv \\
@@ -426,8 +426,8 @@ def main():
         description='Evaluation of generated CT data quality',
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    p.add_argument('--generated',    required=True, type=Path,
-                   help='Directory with gauss_*.json + _gen_error.raw')
+    p.add_argument('--generated',    required=True, nargs='+', type=Path,
+                   help='One or more directories with gauss_*.json + _gen_error.raw')
     p.add_argument('--rpi',          required=True, type=Path,
                    help='Parent directory containing body*/ (e.g. data/raw/RPI)')
     p.add_argument('--real',         required=True, type=Path,
@@ -483,7 +483,9 @@ def main():
             run_med = False
 
     # ── Load data ────────────────────────────────────────────────────────────
-    samples  = load_generated_samples(args.generated, bodies=args.bodies)
+    samples = []
+    for gen_dir in args.generated:
+        samples += load_generated_samples(gen_dir, bodies=args.bodies)
     bodies   = args.bodies or sorted({s['body'] for s in samples})
     hospital = load_hospital_images(args.real)
 
