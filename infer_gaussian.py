@@ -157,7 +157,6 @@ def process_sample(img_id: int,
                    stride: int,
                    device: torch.device,
                    out_dir: Path,
-                   idx: int,
                    seed: int = -1) -> None:
 
     i_clean_raw = load_raw(clean_path)
@@ -185,7 +184,7 @@ def process_sample(img_id: int,
     i_error_gen    = ddpm_sample(ddpm, condition, y_t, stride=stride, seed=seed if seed >= 0 else None)
     i_metal_gen_hu = i_clean_raw + i_error_gen * error_scale
 
-    stem = f'gauss_{idx:04d}_{body_name}_img{img_id}'
+    stem = f'gauss_{img_id:04d}_{body_name}_img{img_id}'
     save_raw_outputs(out_dir, stem, i_error_gen, i_metal_gen_hu, i_clean_raw, i_art_raw)
     save_metadata(out_dir, stem, img_id, body_name, y_vec, feature_cols,
                   error_scale, actual_seed, metalinfo)
@@ -240,7 +239,7 @@ def process_sample(img_id: int,
     fig.suptitle(title, fontsize=8)
     plt.tight_layout()
 
-    fname = out_dir / f'gauss_{idx:04d}_{body_name}_img{img_id}.png'
+    fname = out_dir / f'gauss_{img_id:04d}_{body_name}_img{img_id}.png'
     fname.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(fname, dpi=130, bbox_inches='tight')
     plt.close(fig)
@@ -517,7 +516,6 @@ def main():
             stride=args.stride,
             device=device,
             out_dir=args.out,
-            idx=idx,
             seed=args.seed + idx if args.seed >= 0 else -1,
         )
 
