@@ -67,9 +67,11 @@ def build_groups(samples: list[dict], rpi_dir: Path) -> tuple[list[dict], list[d
       group_b — AAPM:      I_clean + I_error_aapm  (no raw metal point)
 
     Each record contains:
-      I_error_*  — clipped I_error in HU  (for SSIM and Physical FID)
-      I_synth/I_art — full HU image       (for Physical FID feature extraction)
-      I_sino     — clipped to [HU_LO, HU_HI] (fair input for Sinogram/Med-FID)
+      I_error_*      — clipped I_error in HU  (for SSIM and Physical FID)
+      I_synth/I_art  — full HU image          (for Physical FID feature extraction)
+      I_sino         — clipped to [HU_LO, HU_HI]         (for Sinogram/Med-FID)
+      I_sino_masked  — I_sino with artifact mask applied  (for masked FID variants)
+      M_artifact     — binary artifact mask               (for diagnostics)
     """
     group_a, group_b = [], []
 
@@ -89,23 +91,39 @@ def build_groups(samples: list[dict], rpi_dir: Path) -> tuple[list[dict], list[d
         I_error_gen_clip  = np.clip(I_error_gen,     -ERR_CLIP, ERR_CLIP)
         I_error_real_clip = np.clip(I_art - I_clean, -ERR_CLIP, ERR_CLIP)
 
+        # Artifact mask — same logic as SSIM experiment (based on AAPM pair)
+        body_mask = binary_fill_holes(I_clean > -500)
+        I_err_for_tau, _ = preprocess(I_art, I_clean)
+        tau = compute_tau(I_err_for_tau, body_mask)
+        M_artifact = (np.abs(I_error_real_clip) > tau) & body_mask
+
+        # I_sino: full image clipped to [HU_LO, HU_HI]
+        I_sino_a = np.clip(I_clean + I_error_gen_clip,  HU_LO, HU_HI).astype(np.float32)
+        I_sino_b = np.clip(I_clean + I_error_real_clip, HU_LO, HU_HI).astype(np.float32)
+
+        # I_sino_masked: background (air = HU_LO) outside artifact mask
+        I_sino_a_masked = np.where(M_artifact, I_sino_a, HU_LO).astype(np.float32)
+        I_sino_b_masked = np.where(M_artifact, I_sino_b, HU_LO).astype(np.float32)
+
         group_a.append({
-            'img_id':      s['img_id'],
-            'body':        s['body'],
-            'I_synth':     (I_clean + I_error_gen_clip).astype(np.float32),
-            'I_clean':     I_clean,
-            'I_error_gen': I_error_gen_clip,
-            # Clipped to [HU_LO, HU_HI] — used as sinogram / Med-FID input
-            'I_sino':      np.clip(I_clean + I_error_gen_clip, HU_LO, HU_HI).astype(np.float32),
+            'img_id':         s['img_id'],
+            'body':           s['body'],
+            'I_synth':        (I_clean + I_error_gen_clip).astype(np.float32),
+            'I_clean':        I_clean,
+            'I_error_gen':    I_error_gen_clip,
+            'I_sino':         I_sino_a,
+            'I_sino_masked':  I_sino_a_masked,
+            'M_artifact':     M_artifact,
         })
         group_b.append({
-            'img_id':       s['img_id'],
-            'body':         s['body'],
-            'I_art':        I_art,            # raw AAPM — used for SSIM artifact mask
-            'I_clean':      I_clean,
-            'I_error_aapm': I_error_real_clip,
-            # I_clean + I_error (no raw metal blob) clipped to [HU_LO, HU_HI]
-            'I_sino':       np.clip(I_clean + I_error_real_clip, HU_LO, HU_HI).astype(np.float32),
+            'img_id':         s['img_id'],
+            'body':           s['body'],
+            'I_art':          I_art,
+            'I_clean':        I_clean,
+            'I_error_aapm':   I_error_real_clip,
+            'I_sino':         I_sino_b,
+            'I_sino_masked':  I_sino_b_masked,
+            'M_artifact':     M_artifact,
         })
 
     log.info(f'A/B pairs: {len(group_a)} (from {len(samples)} generated samples)')
@@ -199,21 +217,28 @@ def run_physical_fid(group_a: list[dict], group_b: list[dict],
 
 def run_sinogram_fid(group_a: list[dict], group_b: list[dict],
                      hospital: list[tuple[Path, np.ndarray]],
-                     rad_imagenet_path: Path | None = None) -> dict:
+                     rad_imagenet_path: Path | None = None,
+                     use_masked: bool = False) -> dict:
     """[3] Sinogram FID — Radon-domain Frechet distance.
 
     A = Radon(I_clean + I_error_gen)   clipped to [HU_LO, HU_HI]
     B = Radon(I_clean + I_error_aapm)  clipped to [HU_LO, HU_HI]  (no raw metal)
     C = Radon(Hospital_raw)            clipped to [HU_LO, HU_HI]
 
+    use_masked=True: apply artifact mask to A and B (background → HU_LO).
+                     A vs C and B vs C are skipped (hospital has no mask).
+
     Variant 1: 270D statistics (mean/std/P95 per projection angle) — no NN required.
     Variant 2: RadImageNet on sinogram images — if weights are provided.
     """
-    log.info('=== [3] Sinogram FID ===')
+    tag = 'masked' if use_masked else 'full'
+    log.info(f'=== [3] Sinogram FID [{tag}] ===')
 
-    imgs_a = [a['I_sino'] for a in group_a]
-    imgs_b = [b['I_sino'] for b in group_b]
-    imgs_c = [np.clip(img, HU_LO, HU_HI).astype(np.float32) for _, img in hospital]
+    img_key = 'I_sino_masked' if use_masked else 'I_sino'
+    imgs_a = [a[img_key] for a in group_a]
+    imgs_b = [b[img_key] for b in group_b]
+    imgs_c = [] if use_masked else [np.clip(img, HU_LO, HU_HI).astype(np.float32)
+                                    for _, img in hospital]
 
     log.info(f'  A={len(imgs_a)}  B={len(imgs_b)}  C={len(imgs_c)}')
 
@@ -274,7 +299,8 @@ def run_sinogram_fid(group_a: list[dict], group_b: list[dict],
 
 def run_med_fid(group_a: list[dict], group_b: list[dict],
                 hospital: list[tuple[Path, np.ndarray]],
-                rad_imagenet_path: Path) -> dict:
+                rad_imagenet_path: Path,
+                use_masked: bool = False) -> dict:
     """[4] Med-FID — Frechet distance using RadImageNet ResNet50 features.
 
     Images passed to the network (all clipped to [HU_LO, HU_HI]):
@@ -282,13 +308,19 @@ def run_med_fid(group_a: list[dict], group_b: list[dict],
       B = I_clean + I_error_aapm  (AAPM CT without raw metal)
       C = Hospital_raw            (hospital CT, used directly)
 
+    use_masked=True: apply artifact mask to A and B before feature extraction.
+                     A vs C and B vs C are skipped (hospital has no mask).
+
     Each image: HU → [0, 1] → resize 224×224 → 3-channel → ResNet50 → 2048D.
     """
-    log.info('=== [4] Med-FID (RadImageNet, full CT images) ===')
+    tag = 'masked' if use_masked else 'full'
+    log.info(f'=== [4] Med-FID (RadImageNet, full CT images) [{tag}] ===')
 
-    imgs_a = [a['I_sino'] for a in group_a]
-    imgs_b = [b['I_sino'] for b in group_b]
-    imgs_c = [np.clip(img, HU_LO, HU_HI).astype(np.float32) for _, img in hospital]
+    img_key = 'I_sino_masked' if use_masked else 'I_sino'
+    imgs_a = [a[img_key] for a in group_a]
+    imgs_b = [b[img_key] for b in group_b]
+    imgs_c = [] if use_masked else [np.clip(img, HU_LO, HU_HI).astype(np.float32)
+                                    for _, img in hospital]
 
     log.info(f'  A={len(imgs_a)}  B={len(imgs_b)}  C={len(imgs_c)}')
     log.info('  Extracting RadImageNet features from CT images...')
@@ -459,6 +491,13 @@ def main():
                    help='Skip [4] Med-FID (implied when --rad-imagenet is absent and download fails)')
     p.add_argument('--skip-standard-fid', action='store_true',
                    help='Skip [5] Standard FID (ImageNet ResNet50)')
+    # Artifact-mask mode for FID experiments [3][4][5]
+    p.add_argument('--mask-mode', choices=['unmasked', 'masked', 'both'], default='unmasked',
+                   help='Apply artifact mask to A/B images before FID computation. '
+                        '"unmasked" = full image (default); '
+                        '"masked" = only artifact region (background → HU_LO); '
+                        '"both" = compute both and save separately. '
+                        'Hospital (C) is always excluded from masked variants.')
     args = p.parse_args()
 
     args.out.mkdir(parents=True, exist_ok=True)
@@ -468,6 +507,14 @@ def main():
     run_phys    = not args.ssim_only and not args.skip_physical_fid
     run_sino    = not args.ssim_only and not args.skip_sinogram_fid
     run_med     = not args.ssim_only and not args.skip_med_fid
+
+    # Mask modes to iterate over for [3][4][5]
+    if args.mask_mode == 'both':
+        mask_modes = [False, True]
+    elif args.mask_mode == 'masked':
+        mask_modes = [True]
+    else:
+        mask_modes = [False]
     run_std_fid = not args.ssim_only and not args.skip_standard_fid
 
     # ── Ensure ImageNet weights (Standard FID) ───────────────────────────────
@@ -558,103 +605,116 @@ def main():
     else:
         log.info('[2] Physical FID skipped')
 
-    # ── [3] Sinogram FID ─────────────────────────────────────────────────────
-    if run_sino:
-        if len(group_a) == 0 and len(hospital) == 0:
-            log.warning('[3] Sinogram FID skipped — no paired data and no hospital images')
+    # ── [3][4][5] FID experiments — loop over mask modes ─────────────────────
+    for use_masked in mask_modes:
+        sfx    = '_masked' if use_masked else ''        # file suffix
+        s_pfx  = 'masked_' if use_masked else ''        # summary key prefix
+
+        # ── [3] Sinogram FID ─────────────────────────────────────────────────
+        if run_sino:
+            if len(group_a) == 0 and (not use_masked and len(hospital) == 0):
+                log.warning(f'[3] Sinogram FID{sfx} skipped — no data')
+            else:
+                sino_result = run_sinogram_fid(
+                    group_a, group_b, hospital,
+                    rad_imagenet_path=args.rad_imagenet if run_med else None,
+                    use_masked=use_masked,
+                )
+                results[f'sinogram_fid{sfx}'] = sino_result
+                with open(args.out / f'sinogram_fid{sfx}.json', 'w') as f:
+                    json.dump(sino_result, f, indent=2)
+
+                sino_rows = [{'comparison': k, 'frechet_distance': v}
+                             for k, v in sino_result.items() if isinstance(v, float)]
+                if sino_rows:
+                    pd.DataFrame(sino_rows).to_csv(
+                        args.out / f'sinogram_fid{sfx}.csv', index=False)
+                    log.info(f'CSV → {args.out / f"sinogram_fid{sfx}.csv"}')
+
+                for cmp in ['stats_Generated(A)_vs_AAPM(B)',
+                            'stats_Generated(A)_vs_Hospital(C)',
+                            'stats_AAPM(B)_vs_Hospital(C)']:
+                    val = sino_result.get(cmp)
+                    if isinstance(val, float):
+                        summary[f'{s_pfx}sino_{cmp}'] = val
         else:
-            results['sinogram_fid'] = run_sinogram_fid(
-                group_a, group_b, hospital,
-                rad_imagenet_path=args.rad_imagenet if run_med else None,
+            log.info('[3] Sinogram FID skipped')
+
+        # ── [4] Med-FID ──────────────────────────────────────────────────────
+        if run_med:
+            med_result = run_med_fid(
+                group_a, group_b, hospital, args.rad_imagenet,
+                use_masked=use_masked,
             )
-            with open(args.out / 'sinogram_fid.json', 'w') as f:
-                json.dump(results['sinogram_fid'], f, indent=2)
+            results[f'med_fid{sfx}'] = med_result
+            with open(args.out / f'med_fid{sfx}.json', 'w') as f:
+                json.dump(med_result, f, indent=2)
 
-            sino_rows = [{'comparison': k, 'frechet_distance': v}
-                         for k, v in results['sinogram_fid'].items()
-                         if isinstance(v, float)]
-            if sino_rows:
-                pd.DataFrame(sino_rows).to_csv(args.out / 'sinogram_fid.csv', index=False)
-                log.info(f'CSV → {args.out / "sinogram_fid.csv"}')
-
-            for cmp in ['stats_Generated(A)_vs_AAPM(B)',
-                        'stats_Generated(A)_vs_Hospital(C)',
-                        'stats_AAPM(B)_vs_Hospital(C)']:
-                val = results['sinogram_fid'].get(cmp)
-                if isinstance(val, float):
-                    summary[f'sino_{cmp}'] = val
-    else:
-        log.info('[3] Sinogram FID skipped')
-
-    # ── [4] Med-FID ──────────────────────────────────────────────────────────
-    if run_med:
-        results['med_fid'] = run_med_fid(group_a, group_b, hospital, args.rad_imagenet)
-        with open(args.out / 'med_fid.json', 'w') as f:
-            json.dump(results['med_fid'], f, indent=2)
-
-        med_rows = [{'comparison': k, 'frechet_distance': v}
-                    for k, v in results['med_fid'].items()
-                    if isinstance(v, float)]
-        if med_rows:
-            pd.DataFrame(med_rows).to_csv(args.out / 'med_fid.csv', index=False)
-            log.info(f'CSV → {args.out / "med_fid.csv"}')
-
-        for cmp in ['Generated(A)_vs_AAPM(B)',
-                    'Generated(A)_vs_Hospital(C)',
-                    'AAPM(B)_vs_Hospital(C)']:
-            val = results['med_fid'].get(cmp)
-            if isinstance(val, float):
-                summary[f'med_fid_{cmp}'] = val
-    else:
-        log.info('[4] Med-FID skipped')
-
-    # ── [5] Standard FID — ImageNet ResNet50 ─────────────────────────────────
-    if run_std_fid:
-        if len(group_a) == 0 and len(hospital) == 0:
-            log.warning('[5] Standard FID skipped — no data')
-        else:
-            log.info('=== [5] Standard FID (ImageNet ResNet50) ===')
-            imgs_a = [a['I_sino'] for a in group_a]
-            imgs_b = [b['I_sino'] for b in group_b]
-            imgs_c = [np.clip(img, HU_LO, HU_HI).astype(np.float32) for _, img in hospital]
-
-            rf_a = imagenet_features(imgs_a, imagenet_weights) if imgs_a else np.empty((0, 2048))
-            rf_b = imagenet_features(imgs_b, imagenet_weights) if imgs_b else np.empty((0, 2048))
-            rf_c = imagenet_features(imgs_c, imagenet_weights) if imgs_c else np.empty((0, 2048))
-
-            log.info(f'  Features: A{rf_a.shape}  B{rf_b.shape}  C{rf_c.shape}')
-
-            std_fid = {'method': 'ImageNet_ResNet50_2048D'}
-            for fa, fb, la, lb in [
-                (rf_a, rf_b, 'Generated(A)', 'AAPM(B)'),
-                (rf_a, rf_c, 'Generated(A)', 'Hospital(C)'),
-                (rf_b, rf_c, 'AAPM(B)',      'Hospital(C)'),
-            ]:
-                key = f'{la}_vs_{lb}'
-                if fa.shape[0] >= 2 and fb.shape[0] >= 2:
-                    std_fid[key] = frechet_distance(fa, fb)
-                    log.info(f'  Std-FID({la} vs {lb}) = {std_fid[key]:.4f}')
-                else:
-                    std_fid[key] = None
-
-            results['standard_fid'] = std_fid
-            with open(args.out / 'standard_fid.json', 'w') as f:
-                json.dump(std_fid, f, indent=2)
-
-            std_rows = [{'comparison': k, 'frechet_distance': v}
-                        for k, v in std_fid.items() if isinstance(v, float)]
-            if std_rows:
-                pd.DataFrame(std_rows).to_csv(args.out / 'standard_fid.csv', index=False)
-                log.info(f'CSV → {args.out / "standard_fid.csv"}')
+            med_rows = [{'comparison': k, 'frechet_distance': v}
+                        for k, v in med_result.items() if isinstance(v, float)]
+            if med_rows:
+                pd.DataFrame(med_rows).to_csv(args.out / f'med_fid{sfx}.csv', index=False)
+                log.info(f'CSV → {args.out / f"med_fid{sfx}.csv"}')
 
             for cmp in ['Generated(A)_vs_AAPM(B)',
                         'Generated(A)_vs_Hospital(C)',
                         'AAPM(B)_vs_Hospital(C)']:
-                val = std_fid.get(cmp)
+                val = med_result.get(cmp)
                 if isinstance(val, float):
-                    summary[f'std_fid_{cmp}'] = val
-    else:
-        log.info('[5] Standard FID skipped')
+                    summary[f'{s_pfx}med_fid_{cmp}'] = val
+        else:
+            log.info('[4] Med-FID skipped')
+
+        # ── [5] Standard FID — ImageNet ResNet50 ─────────────────────────────
+        if run_std_fid:
+            if len(group_a) == 0 and (not use_masked and len(hospital) == 0):
+                log.warning(f'[5] Standard FID{sfx} skipped — no data')
+            else:
+                log.info(f'=== [5] Standard FID (ImageNet ResNet50) [{("masked" if use_masked else "full")}] ===')
+                img_key = 'I_sino_masked' if use_masked else 'I_sino'
+                imgs_a = [a[img_key] for a in group_a]
+                imgs_b = [b[img_key] for b in group_b]
+                imgs_c = ([] if use_masked else
+                          [np.clip(img, HU_LO, HU_HI).astype(np.float32) for _, img in hospital])
+
+                rf_a = imagenet_features(imgs_a, imagenet_weights) if imgs_a else np.empty((0, 2048))
+                rf_b = imagenet_features(imgs_b, imagenet_weights) if imgs_b else np.empty((0, 2048))
+                rf_c = imagenet_features(imgs_c, imagenet_weights) if imgs_c else np.empty((0, 2048))
+
+                log.info(f'  Features: A{rf_a.shape}  B{rf_b.shape}  C{rf_c.shape}')
+
+                std_fid_res = {'method': f'ImageNet_ResNet50_2048D{"_masked" if use_masked else ""}'}
+                for fa, fb, la, lb in [
+                    (rf_a, rf_b, 'Generated(A)', 'AAPM(B)'),
+                    (rf_a, rf_c, 'Generated(A)', 'Hospital(C)'),
+                    (rf_b, rf_c, 'AAPM(B)',      'Hospital(C)'),
+                ]:
+                    key = f'{la}_vs_{lb}'
+                    if fa.shape[0] >= 2 and fb.shape[0] >= 2:
+                        std_fid_res[key] = frechet_distance(fa, fb)
+                        log.info(f'  Std-FID({la} vs {lb}) = {std_fid_res[key]:.4f}')
+                    else:
+                        std_fid_res[key] = None
+
+                results[f'standard_fid{sfx}'] = std_fid_res
+                with open(args.out / f'standard_fid{sfx}.json', 'w') as f:
+                    json.dump(std_fid_res, f, indent=2)
+
+                std_rows = [{'comparison': k, 'frechet_distance': v}
+                            for k, v in std_fid_res.items() if isinstance(v, float)]
+                if std_rows:
+                    pd.DataFrame(std_rows).to_csv(
+                        args.out / f'standard_fid{sfx}.csv', index=False)
+                    log.info(f'CSV → {args.out / f"standard_fid{sfx}.csv"}')
+
+                for cmp in ['Generated(A)_vs_AAPM(B)',
+                            'Generated(A)_vs_Hospital(C)',
+                            'AAPM(B)_vs_Hospital(C)']:
+                    val = std_fid_res.get(cmp)
+                    if isinstance(val, float):
+                        summary[f'{s_pfx}std_fid_{cmp}'] = val
+        else:
+            log.info(f'[5] Standard FID{sfx} skipped')
 
     # ── Summary ──────────────────────────────────────────────────────────────
     with open(args.out / 'summary.json', 'w') as f:
