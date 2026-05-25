@@ -251,6 +251,38 @@ def match_pairs(target_dir: Path, baseline_dir: Path) -> list[tuple[Path, Path]]
 
 # -- Per-sample processing -----------------------------------------------------
 
+# -- Raw output saving ---------------------------------------------------------
+
+def save_infer_raw(
+    out_dir: Path,
+    stem: str,
+    generated: dict,
+    clean_np: "np.ndarray | None",
+    art_np: "np.ndarray | None",
+) -> None:
+    """Save generated images and inputs as float32 .raw files (512×512).
+
+    Layout mirrors infer_gaussian.py:
+      out_dir/raw/          — model outputs (generated images)
+      out_dir/raw/img/      — input images (clean, real artifact)
+    """
+    raw_dir = out_dir / "raw"
+    img_dir = raw_dir / "img"
+    img_dir.mkdir(parents=True, exist_ok=True)
+
+    for name, arr in generated.items():
+        path = raw_dir / f"{stem}_{name}.raw"
+        path.write_bytes(arr.astype(np.float32).tobytes())
+        print(f"  -> {path}")
+
+    if clean_np is not None:
+        (img_dir / f"{stem}_clean.raw").write_bytes(clean_np.astype(np.float32).tobytes())
+    if art_np is not None:
+        (img_dir / f"{stem}_real_art.raw").write_bytes(art_np.astype(np.float32).tobytes())
+
+
+# -- Per-sample processing -----------------------------------------------------
+
 def process_pair(clean_path: Path | None,
                  art_path: Path | None,
                  gen_ab: Generator | None,
@@ -294,7 +326,8 @@ def process_pair(clean_path: Path | None,
         mask_m_np = mask_a_np = None
         mask_m_t  = mask_a_t  = None
 
-    panels = []
+    panels    = []
+    generated = {}   # name -> np.ndarray (float32, normalized [-1,1])
 
     if has_clean:
         panels.append((clean_np, "Input (clean)"))
@@ -309,8 +342,10 @@ def process_pair(clean_path: Path | None,
 
     # G_AB: clean + masks -> generated artifact
     if gen_ab is not None and has_clean and mask_m_t is not None:
-        label = "CycleGAN G_AB\n(no-mask mode)" if no_masks else "CycleGAN G_AB\n(artifact gen.)"
-        panels.append((run_cyclegan_ab(gen_ab, clean_t, mask_m_t, mask_a_t), label))
+        label  = "CycleGAN G_AB\n(no-mask mode)" if no_masks else "CycleGAN G_AB\n(artifact gen.)"
+        gab_np = run_cyclegan_ab(gen_ab, clean_t, mask_m_t, mask_a_t)
+        panels.append((gab_np, label))
+        generated["cyclegan_ab"] = gab_np
 
     # Diffusion: clean + masks -> generated artifact
     if diff_model is not None and has_clean and mask_m_t is not None:
@@ -320,14 +355,16 @@ def process_pair(clean_path: Path | None,
         if no_masks:
             tag += " (no-mask)"
         print(f"  Diffusion {tag} ({diff_steps} steps)...")
-        panels.append((run_diffusion(diff_model, clean_t, mask_m_t, mask_a_t,
-                                     diff_steps, diff_sampler, diff_t_start),
-                       f"Diffusion {tag}\n({diff_steps} steps)"))
+        diff_np = run_diffusion(diff_model, clean_t, mask_m_t, mask_a_t,
+                                diff_steps, diff_sampler, diff_t_start)
+        panels.append((diff_np, f"Diffusion {tag}\n({diff_steps} steps)"))
+        generated["diffusion"] = diff_np
 
     # G_BA: artifact -> clean (artifact reduction, no masks needed)
     if gen_ba is not None and has_art:
-        panels.append((run_cyclegan_ba(gen_ba, art_t),
-                       "CycleGAN G_BA\n(artifact removal)"))
+        gba_np = run_cyclegan_ba(gen_ba, art_t)
+        panels.append((gba_np, "CycleGAN G_BA\n(artifact removal)"))
+        generated["cyclegan_ba"] = gba_np
 
     if has_art:
         panels.append((art_np, "Ground truth\n(artifact CT)"))
@@ -338,6 +375,8 @@ def process_pair(clean_path: Path | None,
 
     stem = (art_path or clean_path).stem[:30]
     save_figure(panels, stem, out_dir / f"infer_{idx:04d}_{stem}.png")
+    if generated:
+        save_infer_raw(out_dir, f"infer_{idx:04d}_{stem}", generated, clean_np, art_np)
 
 
 # -- CLI -----------------------------------------------------------------------
