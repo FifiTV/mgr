@@ -202,6 +202,9 @@ def run_diffusion(diff_model: DiffusionModel,
             else:
                 alpha_bar_prev = torch.ones(1, device=device)
             x = alpha_bar_prev.sqrt() * x0_pred + (1.0 - alpha_bar_prev).sqrt() * eps_pred
+            
+    x = x.clamp(-1.0, 1.0)
+    print(f"  diff output: min={x.min():.3f} max={x.max():.3f} std={x.std():.3f}")
 
     return x.squeeze().cpu().numpy()
 
