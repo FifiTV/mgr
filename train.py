@@ -108,6 +108,21 @@ def main():
         help='Directory for generated sample images saved each epoch. '
              'Overrides config paths.sample_dir.'
     )
+    parser.add_argument(
+        '--resume',
+        type=str,
+        default=None,
+        help='Resume diffusion training from this output directory. '
+             'Loads latest checkpoint from <dir>/checkpoints/diffusion/<mode>/latest/. '
+             '--epochs must be the TOTAL target epoch count (e.g. 300 to add 200 to 100 done).'
+    )
+    parser.add_argument(
+        '--no-metal-dt',
+        action='store_true',
+        default=False,
+        help='Gaussian only: use a binary metal mask instead of the distance-transform '
+             'soft field. Equivalent to metal_dt_enabled=false in config [gaussian].'
+    )
 
     args = parser.parse_args()
 
@@ -236,9 +251,13 @@ def main():
                 config, device,
                 output_dir,
                 label_mode=args.label_mode,
+                resume_from=args.resume,
             )
         
         elif args.type == 'gaussian':
+            if args.no_metal_dt:
+                config.setdefault('gaussian', {})['metal_dt_enabled'] = False
+
             rpi_base = rpi_path or data_path
 
             # Resolve body dirs for training split

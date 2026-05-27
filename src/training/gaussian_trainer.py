@@ -207,6 +207,7 @@ def train_gaussian(config: dict,
     metal_threshold_hu  = gaus_cfg.get('metal_threshold_hu',
                               config.get('data', {}).get('metal_threshold_hu', 500.0))
     metal_dt_radius     = gaus_cfg.get('metal_dt_radius', 200.0)
+    metal_dt_enabled    = gaus_cfg.get('metal_dt_enabled', True)
     error_scale         = gaus_cfg.get('error_scale', 310.5)
     checkpoint_interval = config.get('training', {}).get('checkpoint_interval', 10)
     num_workers         = config.get('dataset', {}).get('num_workers', 2)
@@ -228,12 +229,14 @@ def train_gaussian(config: dict,
     logger.info(f"Features loaded: {len(features_df)} rows")
 
     # ── Dataset / DataLoader ──────────────────────────────────────────────────────
+    logger.info(f"metal_dt_enabled={metal_dt_enabled}  metal_dt_radius={metal_dt_radius}")
     dataset = GaussianDataset(
         body_dirs=body_dirs,
         features_df=features_df,
         p_random_metal=p_random_metal,
         metal_threshold_hu=metal_threshold_hu,
         metal_dt_radius=metal_dt_radius,
+        use_distance_transform=metal_dt_enabled,
         error_scale=error_scale,
         feature_cols=feature_cols,
     )

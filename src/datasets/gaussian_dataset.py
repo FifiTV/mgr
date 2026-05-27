@@ -196,6 +196,7 @@ class GaussianDataset(Dataset):
                  p_random_metal: float = 0.5,
                  metal_threshold_hu: float = METAL_THRESHOLD_HU,
                  metal_dt_radius: float = 200.0,
+                 use_distance_transform: bool = True,
                  error_scale: float = 642.8,
                  preload: bool = False,
                  feature_cols: Optional[List[str]] = None):
@@ -207,14 +208,20 @@ class GaussianDataset(Dataset):
             metal_threshold_hu : HU threshold for fallback metal mask (when Metal/ missing).
                                  Applied to |I_metal - I_clean|; at 2500 HU this isolates
                                  the implant itself, not the surrounding bloom artifacts.
+            metal_dt_radius  : radius [px] for distance-transform soft field (used only when
+                               use_distance_transform=True).
+            use_distance_transform : if True (default), M_metal is a soft influence field
+                               decaying from 1.0 at the implant to 0 at ≥metal_dt_radius px.
+                               If False, M_metal is a binary 0/1 mask.
             feature_cols     : list of feature column names to use as y vector.
                                Defaults to FEATURE_COLS (all 7 available features).
             preload          : if True, all .raw files are loaded into RAM at init.
                                Fast for small datasets; skip for large ones (>50 GB).
         """
-        self.p_random_metal      = p_random_metal
-        self.metal_threshold_hu  = metal_threshold_hu
-        self.metal_dt_radius     = metal_dt_radius
+        self.p_random_metal         = p_random_metal
+        self.metal_threshold_hu     = metal_threshold_hu
+        self.metal_dt_radius        = metal_dt_radius
+        self.use_distance_transform = use_distance_transform
         self.error_scale         = error_scale
         self.feature_cols        = list(feature_cols) if feature_cols else FEATURE_COLS
         self._cache: Optional[dict] = {} if preload else None
@@ -303,6 +310,9 @@ class GaussianDataset(Dataset):
             i_art   = self._load_raw(record['art_path'])
             i_clean = self._load_raw(record['clean_path'])
             binary  = np.abs(i_art - i_clean) > self.metal_threshold_hu
+
+        if not self.use_distance_transform:
+            return binary.astype(np.float32)
 
         dist = distance_transform_edt(~binary)
         return np.clip(1.0 - dist / self.metal_dt_radius, 0.0, 1.0).astype(np.float32)
