@@ -43,7 +43,8 @@ sys.path.insert(0, str(_ROOT))
 
 from src.experiments.eval_utils import (
     FEATURE_COLS, find_aapm_pair, frechet_distance, frechet_per_feature,
-    imagenet_features, load_generated_samples, load_hospital_images, load_raw,
+    imagenet_features, load_generated_samples, load_hospital_images,
+    load_magnet_images, load_raw,
     normalize_features, radimagenet_features, save_fid_csv,
     sinogram_images, sinogram_stat_features,
 )
@@ -180,10 +181,12 @@ def run_ssim_exp(group_a: list[dict], group_b: list[dict]) -> dict:
 def run_physical_fid(group_a: list[dict], group_b: list[dict],
                      features_norm_path: Path, clip_stats: dict,
                      bodies: list[str] | None = None,
+                     magnet_images: list[tuple] | None = None,
                      ) -> tuple[dict, pd.DataFrame, pd.DataFrame]:
-    """[2] Frechet distance on 6 physical features: Generated (A) vs AAPM (B).
+    """[2] Frechet distance on 6 physical features: Generated (A) vs AAPM (B) [vs Magnet (D)].
 
     Hospital data excluded — no (I_art, I_clean) pairs available.
+    Magnet/jitter images (D): features extracted with I_clean=zeros (signal vs zero baseline).
     """
     log.info('=== [2] Physical FID — Generated vs AAPM ===')
 
@@ -207,8 +210,33 @@ def run_physical_fid(group_a: list[dict], group_b: list[dict],
         log.warning('  [2] Skipped — fewer than 2 generated samples with matched AAPM pairs')
         return {'Generated_vs_AAPM': None, 'n_gen': len(df_gen), 'n_aapm': len(df_aapm)}, df_gen, df_aapm
 
-    fd = frechet_per_feature(df_gen, df_aapm, 'Generated', 'AAPM')
-    return {'Generated_vs_AAPM': fd, 'n_gen': len(df_gen), 'n_aapm': len(df_aapm)}, df_gen, df_aapm
+    result = {}
+    result['Generated_vs_AAPM'] = frechet_per_feature(df_gen, df_aapm, 'Generated', 'AAPM')
+    result['n_gen']  = len(df_gen)
+    result['n_aapm'] = len(df_aapm)
+
+    # Magnet/jitter group D — features extracted with I_clean=zeros
+    if magnet_images:
+        records_mag = []
+        for i, (path, img) in enumerate(magnet_images):
+            i_clean_zero = np.zeros_like(img)
+            row = extract_features(img, i_clean_zero)
+            row['img_id'] = i
+            records_mag.append(row)
+        df_mag_raw = pd.DataFrame(records_mag)
+        df_mag = normalize_features(df_mag_raw, clip_stats)
+        log.info(f'  Magnet/jitter: {len(df_mag)}')
+
+        if len(df_mag) >= 2:
+            result['Generated_vs_Magnet'] = frechet_per_feature(df_gen, df_mag, 'Generated', 'Magnet')
+            result['AAPM_vs_Magnet']      = frechet_per_feature(df_aapm, df_mag, 'AAPM', 'Magnet')
+            result['n_magnet'] = len(df_mag)
+        else:
+            log.warning('  Magnet group: fewer than 2 images, skipping FD')
+    else:
+        df_mag = pd.DataFrame()
+
+    return result, df_gen, df_aapm
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -218,12 +246,14 @@ def run_physical_fid(group_a: list[dict], group_b: list[dict],
 def run_sinogram_fid(group_a: list[dict], group_b: list[dict],
                      hospital: list[tuple[Path, np.ndarray]],
                      rad_imagenet_path: Path | None = None,
-                     use_masked: bool = False) -> dict:
+                     use_masked: bool = False,
+                     magnet_images: list[tuple] | None = None) -> dict:
     """[3] Sinogram FID — Radon-domain Frechet distance.
 
     A = Radon(I_clean + I_error_gen)   clipped to [HU_LO, HU_HI]
     B = Radon(I_clean + I_error_aapm)  clipped to [HU_LO, HU_HI]  (no raw metal)
     C = Radon(Hospital_raw)            clipped to [HU_LO, HU_HI]
+    D = Radon(Magnet/jitter)           clipped to [HU_LO, HU_HI]  (optional)
 
     use_masked=True: apply artifact mask to A and B (background → HU_LO).
                      A vs C and B vs C are skipped (hospital has no mask).
@@ -239,8 +269,10 @@ def run_sinogram_fid(group_a: list[dict], group_b: list[dict],
     imgs_b = [b[img_key] for b in group_b]
     imgs_c = [] if use_masked else [np.clip(img, HU_LO, HU_HI).astype(np.float32)
                                     for _, img in hospital]
+    imgs_d = [np.clip(img, HU_LO, HU_HI).astype(np.float32)
+              for _, img in (magnet_images or [])]
 
-    log.info(f'  A={len(imgs_a)}  B={len(imgs_b)}  C={len(imgs_c)}')
+    log.info(f'  A={len(imgs_a)}  B={len(imgs_b)}  C={len(imgs_c)}  D={len(imgs_d)}')
 
     # ── Variant 1: statistics (270D) ──────────────────────────────────────────
     log.info('  Computing sinogram statistics (270D)...')
@@ -248,13 +280,22 @@ def run_sinogram_fid(group_a: list[dict], group_b: list[dict],
     feats_b = np.array([sinogram_stat_features(img) for img in imgs_b])
     feats_c = (np.array([sinogram_stat_features(img) for img in imgs_c])
                if imgs_c else np.empty((0, 270)))
+    feats_d = (np.array([sinogram_stat_features(img) for img in imgs_d])
+               if imgs_d else np.empty((0, 270)))
 
     results = {'method_stats': 'sinogram_statistics_270D'}
-    for fa, fb, la, lb in [
+    pairs = [
         (feats_a, feats_b, 'Generated(A)', 'AAPM(B)'),
         (feats_a, feats_c, 'Generated(A)', 'Hospital(C)'),
         (feats_b, feats_c, 'AAPM(B)',      'Hospital(C)'),
-    ]:
+    ]
+    if imgs_d:
+        pairs += [
+            (feats_a, feats_d, 'Generated(A)', 'Magnet(D)'),
+            (feats_b, feats_d, 'AAPM(B)',      'Magnet(D)'),
+            (feats_c, feats_d, 'Hospital(C)',   'Magnet(D)'),
+        ]
+    for fa, fb, la, lb in pairs:
         key = f'stats_{la}_vs_{lb}'
         if fa.shape[0] >= 2 and fb.shape[0] >= 2:
             results[key] = frechet_distance(fa, fb)
@@ -269,18 +310,28 @@ def run_sinogram_fid(group_a: list[dict], group_b: list[dict],
         sinos_a = sinogram_images(imgs_a)
         sinos_b = sinogram_images(imgs_b)
         sinos_c = sinogram_images(imgs_c) if imgs_c else []
+        sinos_d = sinogram_images(imgs_d) if imgs_d else []
 
         rf_a = radimagenet_features(sinos_a, rad_imagenet_path)
         rf_b = radimagenet_features(sinos_b, rad_imagenet_path)
         rf_c = (radimagenet_features(sinos_c, rad_imagenet_path)
                 if sinos_c else np.empty((0, 2048)))
+        rf_d = (radimagenet_features(sinos_d, rad_imagenet_path)
+                if sinos_d else np.empty((0, 2048)))
 
         results['method_radimagenet_sino'] = 'RadImageNet_ResNet50_2048D_sinograms'
-        for fa, fb, la, lb in [
+        rad_pairs = [
             (rf_a, rf_b, 'Generated(A)', 'AAPM(B)'),
             (rf_a, rf_c, 'Generated(A)', 'Hospital(C)'),
             (rf_b, rf_c, 'AAPM(B)',      'Hospital(C)'),
-        ]:
+        ]
+        if imgs_d:
+            rad_pairs += [
+                (rf_a, rf_d, 'Generated(A)', 'Magnet(D)'),
+                (rf_b, rf_d, 'AAPM(B)',      'Magnet(D)'),
+                (rf_c, rf_d, 'Hospital(C)',   'Magnet(D)'),
+            ]
+        for fa, fb, la, lb in rad_pairs:
             key = f'radIN_sino_{la}_vs_{lb}'
             if fa.shape[0] >= 2 and fb.shape[0] >= 2:
                 results[key] = frechet_distance(fa, fb)
@@ -300,13 +351,15 @@ def run_sinogram_fid(group_a: list[dict], group_b: list[dict],
 def run_med_fid(group_a: list[dict], group_b: list[dict],
                 hospital: list[tuple[Path, np.ndarray]],
                 rad_imagenet_path: Path,
-                use_masked: bool = False) -> dict:
+                use_masked: bool = False,
+                magnet_images: list[tuple] | None = None) -> dict:
     """[4] Med-FID — Frechet distance using RadImageNet ResNet50 features.
 
     Images passed to the network (all clipped to [HU_LO, HU_HI]):
       A = I_clean + I_error_gen   (synthesized CT)
       B = I_clean + I_error_aapm  (AAPM CT without raw metal)
       C = Hospital_raw            (hospital CT, used directly)
+      D = Magnet/jitter           (optional, used directly)
 
     use_masked=True: apply artifact mask to A and B before feature extraction.
                      A vs C and B vs C are skipped (hospital has no mask).
@@ -321,23 +374,34 @@ def run_med_fid(group_a: list[dict], group_b: list[dict],
     imgs_b = [b[img_key] for b in group_b]
     imgs_c = [] if use_masked else [np.clip(img, HU_LO, HU_HI).astype(np.float32)
                                     for _, img in hospital]
+    imgs_d = [np.clip(img, HU_LO, HU_HI).astype(np.float32)
+              for _, img in (magnet_images or [])]
 
-    log.info(f'  A={len(imgs_a)}  B={len(imgs_b)}  C={len(imgs_c)}')
+    log.info(f'  A={len(imgs_a)}  B={len(imgs_b)}  C={len(imgs_c)}  D={len(imgs_d)}')
     log.info('  Extracting RadImageNet features from CT images...')
 
     rf_a = radimagenet_features(imgs_a, rad_imagenet_path)
     rf_b = radimagenet_features(imgs_b, rad_imagenet_path)
     rf_c = (radimagenet_features(imgs_c, rad_imagenet_path)
             if imgs_c else np.empty((0, 2048)))
+    rf_d = (radimagenet_features(imgs_d, rad_imagenet_path)
+            if imgs_d else np.empty((0, 2048)))
 
-    log.info(f'  Features: A{rf_a.shape}  B{rf_b.shape}  C{rf_c.shape}')
+    log.info(f'  Features: A{rf_a.shape}  B{rf_b.shape}  C{rf_c.shape}  D{rf_d.shape}')
 
     results = {'method': 'RadImageNet_ResNet50_2048D_full_images'}
-    for fa, fb, la, lb in [
+    pairs = [
         (rf_a, rf_b, 'Generated(A)', 'AAPM(B)'),
         (rf_a, rf_c, 'Generated(A)', 'Hospital(C)'),
         (rf_b, rf_c, 'AAPM(B)',      'Hospital(C)'),
-    ]:
+    ]
+    if imgs_d:
+        pairs += [
+            (rf_a, rf_d, 'Generated(A)', 'Magnet(D)'),
+            (rf_b, rf_d, 'AAPM(B)',      'Magnet(D)'),
+            (rf_c, rf_d, 'Hospital(C)',   'Magnet(D)'),
+        ]
+    for fa, fb, la, lb in pairs:
         key = f'{la}_vs_{lb}'
         if fa.shape[0] >= 2 and fb.shape[0] >= 2:
             results[key] = frechet_distance(fa, fb)
@@ -473,6 +537,11 @@ def main():
     p.add_argument('--bodies',       nargs='+', default=None, metavar='BODY',
                    help='Body variants to include (e.g. --bodies body8). '
                         'Default: all bodies found in --generated.')
+    p.add_argument('--magnet',       type=Path, default=None,
+                   help='Directory with magnet/jitter images (jitter*.raw). '
+                        'Added to [2] Physical FID as group D. '
+                        'Shape parsed from filename (H512_W512); features extracted '
+                        'with I_clean=zeros (signal vs zero baseline).')
     p.add_argument('--rad-imagenet', type=Path, default=None,
                    help='RadImageNet ResNet50 weights (.pt). '
                         'If missing, downloaded from HuggingFace (Lab-Rasool/RadImageNet).')
@@ -535,6 +604,7 @@ def main():
         samples += load_generated_samples(gen_dir, bodies=args.bodies)
     bodies   = args.bodies or sorted({s['body'] for s in samples})
     hospital = load_hospital_images(args.real)
+    magnet   = load_magnet_images(args.magnet) if args.magnet else []
 
     with open(args.clip_stats) as f:
         clip_stats = json.load(f)
@@ -582,15 +652,20 @@ def main():
     # ── [2] Physical FID ─────────────────────────────────────────────────────
     if run_phys:
         fid_result, df_gen, df_aapm = run_physical_fid(
-            group_a, group_b, args.features, clip_stats, bodies=bodies,
+            group_a, group_b, args.features, clip_stats,
+            bodies=bodies,
+            magnet_images=magnet or None,
         )
         results['physical_fid'] = fid_result
         with open(args.out / 'physical_fid.json', 'w') as f:
             json.dump(fid_result, f, indent=2)
 
-        if fid_result.get('Generated_vs_AAPM'):
-            save_fid_csv({'Generated_vs_AAPM': fid_result['Generated_vs_AAPM']},
-                         args.out / 'physical_fid.csv')
+        phys_csv_groups = {}
+        for key in ('Generated_vs_AAPM', 'Generated_vs_Magnet', 'AAPM_vs_Magnet'):
+            if fid_result.get(key):
+                phys_csv_groups[key] = fid_result[key]
+        if phys_csv_groups:
+            save_fid_csv(phys_csv_groups, args.out / 'physical_fid.csv')
 
         if not df_gen.empty and FEATURE_COLS[0] in df_gen.columns:
             df_gen_out  = df_gen[FEATURE_COLS].copy();  df_gen_out['dataset']  = 'Generated'
@@ -602,6 +677,10 @@ def main():
 
         summary['phys_fd_Generated_vs_AAPM'] = (
             (fid_result.get('Generated_vs_AAPM') or {}).get('combined_6D'))
+        for key in ('Generated_vs_Magnet', 'AAPM_vs_Magnet'):
+            val = (fid_result.get(key) or {}).get('combined_6D')
+            if val is not None:
+                summary[f'phys_fd_{key}'] = val
     else:
         log.info('[2] Physical FID skipped')
 
@@ -619,6 +698,7 @@ def main():
                     group_a, group_b, hospital,
                     rad_imagenet_path=args.rad_imagenet if run_med else None,
                     use_masked=use_masked,
+                    magnet_images=magnet or None,
                 )
                 results[f'sinogram_fid{sfx}'] = sino_result
                 with open(args.out / f'sinogram_fid{sfx}.json', 'w') as f:
@@ -645,6 +725,7 @@ def main():
             med_result = run_med_fid(
                 group_a, group_b, hospital, args.rad_imagenet,
                 use_masked=use_masked,
+                magnet_images=magnet or None,
             )
             results[f'med_fid{sfx}'] = med_result
             with open(args.out / f'med_fid{sfx}.json', 'w') as f:
@@ -676,19 +757,29 @@ def main():
                 imgs_b = [b[img_key] for b in group_b]
                 imgs_c = ([] if use_masked else
                           [np.clip(img, HU_LO, HU_HI).astype(np.float32) for _, img in hospital])
+                imgs_d = [np.clip(img, HU_LO, HU_HI).astype(np.float32)
+                          for _, img in (magnet or [])]
 
                 rf_a = imagenet_features(imgs_a, imagenet_weights) if imgs_a else np.empty((0, 2048))
                 rf_b = imagenet_features(imgs_b, imagenet_weights) if imgs_b else np.empty((0, 2048))
                 rf_c = imagenet_features(imgs_c, imagenet_weights) if imgs_c else np.empty((0, 2048))
+                rf_d = imagenet_features(imgs_d, imagenet_weights) if imgs_d else np.empty((0, 2048))
 
-                log.info(f'  Features: A{rf_a.shape}  B{rf_b.shape}  C{rf_c.shape}')
+                log.info(f'  Features: A{rf_a.shape}  B{rf_b.shape}  C{rf_c.shape}  D{rf_d.shape}')
 
                 std_fid_res = {'method': f'ImageNet_ResNet50_2048D{"_masked" if use_masked else ""}'}
-                for fa, fb, la, lb in [
+                std_pairs = [
                     (rf_a, rf_b, 'Generated(A)', 'AAPM(B)'),
                     (rf_a, rf_c, 'Generated(A)', 'Hospital(C)'),
                     (rf_b, rf_c, 'AAPM(B)',      'Hospital(C)'),
-                ]:
+                ]
+                if imgs_d:
+                    std_pairs += [
+                        (rf_a, rf_d, 'Generated(A)', 'Magnet(D)'),
+                        (rf_b, rf_d, 'AAPM(B)',      'Magnet(D)'),
+                        (rf_c, rf_d, 'Hospital(C)',   'Magnet(D)'),
+                    ]
+                for fa, fb, la, lb in std_pairs:
                     key = f'{la}_vs_{lb}'
                     if fa.shape[0] >= 2 and fb.shape[0] >= 2:
                         std_fid_res[key] = frechet_distance(fa, fb)

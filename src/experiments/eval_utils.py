@@ -10,6 +10,7 @@ Import:
 
 import json
 import logging
+import re
 from pathlib import Path
 
 import numpy as np
@@ -75,6 +76,23 @@ def find_aapm_pair(rpi_dir: Path, body: str, img_id: int) -> tuple[Path, Path] |
     if art_path.exists() and clean_path.exists():
         return art_path, clean_path
     return None
+
+
+def load_magnet_images(magnet_dir: Path) -> list[tuple[Path, np.ndarray]]:
+    """Load magnet/jitter images — files whose names start with 'jitter'.
+
+    Shape is parsed from the filename (e.g. H512_W512); falls back to SHAPE.
+    Each file is read with np.fromfile(path, dtype=np.float32) and reshaped.
+    Returns list of (path, array) pairs, sorted by filename.
+    """
+    result = []
+    for f in sorted(magnet_dir.glob('jitter*.raw')):
+        m = re.search(r'H(\d+)_W(\d+)', f.stem)
+        h, w = (int(m.group(1)), int(m.group(2))) if m else SHAPE
+        img = np.fromfile(f, dtype=np.float32).reshape(h, w)
+        result.append((f, img))
+    log.info(f'Magnet/jitter images: {len(result)} from {magnet_dir}')
+    return result
 
 
 def load_hospital_images(real_dir: Path) -> list[tuple[Path, np.ndarray]]:
