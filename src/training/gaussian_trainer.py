@@ -76,7 +76,10 @@ def gaussian_vicinal_loss(eps: torch.Tensor,
     y_target for the whole batch.
 
     L = mean_i( w_i * ||eps_i - eps_pred_i||^2 )
-    w_i = exp(-||y_target - y_i||^2 / (2*sigma^2))
+    w_i = exp(-mean_j((y_target_j - y_i_j)^2) / (2*sigma^2))
+
+    .mean() instead of .sum() over feature dims: sigma is dimension-independent,
+    so the same sigma value gives the same neighborhood width regardless of y_dim.
 
     Args:
         eps       : [B, 1, H, W]  true noise
@@ -92,7 +95,7 @@ def gaussian_vicinal_loss(eps: torch.Tensor,
         y_target = y_target.unsqueeze(0)              # [1, 6]
 
     diff    = y_target - y_i                           # [B, 6]
-    weights = torch.exp(-diff.pow(2).sum(dim=1) / (2 * sigma ** 2))  # [B]
+    weights = torch.exp(-diff.pow(2).mean(dim=1) / (2 * sigma ** 2))  # [B]
     mse     = (eps - eps_pred).pow(2).mean(dim=[1, 2, 3])             # [B]
     loss    = (weights * mse).mean()
 
