@@ -247,7 +247,9 @@ def run_sinogram_fid(group_a: list[dict], group_b: list[dict],
                      hospital: list[tuple[Path, np.ndarray]],
                      rad_imagenet_path: Path | None = None,
                      use_masked: bool = False,
-                     magnet_images: list[tuple] | None = None) -> dict:
+                     magnet_images: list[tuple] | None = None,
+                     max_c: int | None = None,
+                     max_d: int | None = None) -> dict:
     """[3] Sinogram FID — Radon-domain Frechet distance.
 
     A = Radon(I_clean + I_error_gen)   clipped to [HU_LO, HU_HI]
@@ -267,9 +269,12 @@ def run_sinogram_fid(group_a: list[dict], group_b: list[dict],
     img_key = 'I_sino_masked' if use_masked else 'I_sino'
     imgs_a = [a[img_key] for a in group_a]
     imgs_b = [b[img_key] for b in group_b]
-    # C and D are reference groups — always used unmasked (no artifact mask available)
-    imgs_c = [np.clip(img, HU_LO, HU_HI).astype(np.float32) for _, img in hospital]
-    imgs_d = [np.clip(img, HU_LO, HU_HI).astype(np.float32) for _, img in (magnet_images or [])]
+    # C and D are reference groups — always used unmasked (no artifact mask available).
+    # Subsampled when max_c / max_d set to keep runtime and memory manageable.
+    hosp_src = hospital if max_c is None else hospital[:max_c]
+    magn_src  = (magnet_images or []) if max_d is None else (magnet_images or [])[:max_d]
+    imgs_c = [np.clip(img, HU_LO, HU_HI).astype(np.float32) for _, img in hosp_src]
+    imgs_d = [np.clip(img, HU_LO, HU_HI).astype(np.float32) for _, img in magn_src]
 
     log.info(f'  A={len(imgs_a)}  B={len(imgs_b)}  C={len(imgs_c)}  D={len(imgs_d)}')
 
@@ -558,6 +563,13 @@ def main():
                    help='Skip [4] Med-FID (implied when --rad-imagenet is absent and download fails)')
     p.add_argument('--skip-standard-fid', action='store_true',
                    help='Skip [5] Standard FID (ImageNet ResNet50)')
+    p.add_argument('--sino-max-c',  type=int, default=2000, metavar='N',
+                   help='Max hospital (C) images for [3] Sinogram FID. '
+                        'Radon transform is slow — default 2000 keeps runtime feasible. '
+                        '0 = no limit (use all).')
+    p.add_argument('--sino-max-d',  type=int, default=0, metavar='N',
+                   help='Max magnet (D) images for [3] Sinogram FID. '
+                        '0 = no limit (use all, default).')
     # Artifact-mask mode for FID experiments [3][4][5]
     p.add_argument('--mask-mode', choices=['unmasked', 'masked', 'both'], default='unmasked',
                    help='Apply artifact mask to A/B images before FID computation. '
@@ -697,6 +709,8 @@ def main():
                     rad_imagenet_path=args.rad_imagenet if run_med else None,
                     use_masked=use_masked,
                     magnet_images=magnet or None,
+                    max_c=args.sino_max_c or None,
+                    max_d=args.sino_max_d or None,
                 )
                 results[f'sinogram_fid{sfx}'] = sino_result
                 with open(args.out / f'sinogram_fid{sfx}.json', 'w') as f:
