@@ -283,8 +283,17 @@ def train_gaussian(config: dict,
         csv.writer(_f).writerow(['epoch', 'loss', 'sigma', 'mean_weight', 'avg_dist', 'lr'])
     logger.info(f"Metrics CSV: {hist_csv_path}")
 
-    # Fixed condition batch for sample generation (grabbed on first batch)
-    sample_condition: Optional[torch.Tensor] = None
+    # Fixed condition for visualization — built WITHOUT random metal swap so each
+    # I_clean is paired with its own M_metal, not a randomly swapped one.
+    _n_vis = min(4, len(dataset))
+    _p_save = dataset.p_random_metal
+    dataset.p_random_metal = 0.0
+    _vis = [dataset[i] for i in range(_n_vis)]
+    dataset.p_random_metal = _p_save
+    _i_clean_vis = torch.stack([s['i_clean'] for s in _vis])
+    _m_metal_vis = torch.stack([s['m_metal'] for s in _vis])
+    sample_condition = torch.cat([_i_clean_vis, _m_metal_vis], dim=1).cpu()
+    del _vis, _i_clean_vis, _m_metal_vis
 
     # ── Training loop ─────────────────────────────────────────────────────────────
     for epoch in range(n_epochs):
@@ -301,10 +310,6 @@ def train_gaussian(config: dict,
             y_i      = batch['y'].to(device)         # [B, 6]
 
             condition = torch.cat([i_clean, m_metal], dim=1)  # [B, 2, H, W]
-
-            # Grab fixed condition for sample generation
-            if sample_condition is None:
-                sample_condition = condition.detach().cpu()
 
             # Sample y_target as a random row from the current batch's feature vectors.
             # Using torch.rand would land in empty regions of feature space (U[0,1]^F
