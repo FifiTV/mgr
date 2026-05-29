@@ -267,10 +267,9 @@ def run_sinogram_fid(group_a: list[dict], group_b: list[dict],
     img_key = 'I_sino_masked' if use_masked else 'I_sino'
     imgs_a = [a[img_key] for a in group_a]
     imgs_b = [b[img_key] for b in group_b]
-    imgs_c = [] if use_masked else [np.clip(img, HU_LO, HU_HI).astype(np.float32)
-                                    for _, img in hospital]
-    imgs_d = [np.clip(img, HU_LO, HU_HI).astype(np.float32)
-              for _, img in (magnet_images or [])]
+    # C and D are reference groups — always used unmasked (no artifact mask available)
+    imgs_c = [np.clip(img, HU_LO, HU_HI).astype(np.float32) for _, img in hospital]
+    imgs_d = [np.clip(img, HU_LO, HU_HI).astype(np.float32) for _, img in (magnet_images or [])]
 
     log.info(f'  A={len(imgs_a)}  B={len(imgs_b)}  C={len(imgs_c)}  D={len(imgs_d)}')
 
@@ -372,10 +371,9 @@ def run_med_fid(group_a: list[dict], group_b: list[dict],
     img_key = 'I_sino_masked' if use_masked else 'I_sino'
     imgs_a = [a[img_key] for a in group_a]
     imgs_b = [b[img_key] for b in group_b]
-    imgs_c = [] if use_masked else [np.clip(img, HU_LO, HU_HI).astype(np.float32)
-                                    for _, img in hospital]
-    imgs_d = [np.clip(img, HU_LO, HU_HI).astype(np.float32)
-              for _, img in (magnet_images or [])]
+    # C and D are reference groups — always used unmasked
+    imgs_c = [np.clip(img, HU_LO, HU_HI).astype(np.float32) for _, img in hospital]
+    imgs_d = [np.clip(img, HU_LO, HU_HI).astype(np.float32) for _, img in (magnet_images or [])]
 
     log.info(f'  A={len(imgs_a)}  B={len(imgs_b)}  C={len(imgs_c)}  D={len(imgs_d)}')
     log.info('  Extracting RadImageNet features from CT images...')
@@ -755,8 +753,8 @@ def main():
                 img_key = 'I_sino_masked' if use_masked else 'I_sino'
                 imgs_a = [a[img_key] for a in group_a]
                 imgs_b = [b[img_key] for b in group_b]
-                imgs_c = ([] if use_masked else
-                          [np.clip(img, HU_LO, HU_HI).astype(np.float32) for _, img in hospital])
+                # C and D are reference groups — always used unmasked
+                imgs_c = [np.clip(img, HU_LO, HU_HI).astype(np.float32) for _, img in hospital]
                 imgs_d = [np.clip(img, HU_LO, HU_HI).astype(np.float32)
                           for _, img in (magnet or [])]
 
