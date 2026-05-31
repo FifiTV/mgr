@@ -123,6 +123,14 @@ def main():
         help='Gaussian only: use a binary metal mask instead of the distance-transform '
              'soft field. Equivalent to metal_dt_enabled=false in config [gaussian].'
     )
+    parser.add_argument(
+        '--no-metal-mask',
+        action='store_true',
+        default=False,
+        help='Gaussian only: condition on I_clean only (no M_metal channel). '
+             'UNet uses in_ch=2 instead of 3. '
+             'Equivalent to use_metal_mask=false in config [gaussian].'
+    )
 
     args = parser.parse_args()
 
@@ -257,6 +265,8 @@ def main():
         elif args.type == 'gaussian':
             if args.no_metal_dt:
                 config.setdefault('gaussian', {})['metal_dt_enabled'] = False
+            if args.no_metal_mask:
+                config.setdefault('gaussian', {})['use_metal_mask'] = False
 
             rpi_base = rpi_path or data_path
 

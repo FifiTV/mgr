@@ -95,6 +95,7 @@ def gaussian_vicinal_loss(eps: torch.Tensor,
         y_target = y_target.unsqueeze(0)              # [1, 6]
 
     diff    = y_target - y_i                           # [B, 6]
+    # weights = torch.exp(-diff.pow(2).sum(dim=1) / (2 * sigma ** 2))  # [B]
     weights = torch.exp(-diff.pow(2).mean(dim=1) / (2 * sigma ** 2))  # [B]
     mse     = (eps - eps_pred).pow(2).mean(dim=[1, 2, 3])             # [B]
     loss    = (weights * mse).mean()
@@ -211,6 +212,7 @@ def train_gaussian(config: dict,
                               config.get('data', {}).get('metal_threshold_hu', 500.0))
     metal_dt_radius     = gaus_cfg.get('metal_dt_radius', 200.0)
     metal_dt_enabled    = gaus_cfg.get('metal_dt_enabled', True)
+    use_metal_mask      = gaus_cfg.get('use_metal_mask', True)
     error_scale         = gaus_cfg.get('error_scale', 310.5)
     checkpoint_interval = config.get('training', {}).get('checkpoint_interval', 10)
     num_workers         = config.get('dataset', {}).get('num_workers', 2)
@@ -221,7 +223,7 @@ def train_gaussian(config: dict,
     logger.info(f"T={T}, beta_schedule={beta_schedule}, epochs={n_epochs}, "
                 f"batch={batch_size}, lr={lr}")
     logger.info(f"sigma: {sigma_max} -> {sigma_min} (cosine)")
-    logger.info(f"p_random_metal={p_random_metal}, ema_decay={ema_decay}")
+    logger.info(f"p_random_metal={p_random_metal}, ema_decay={ema_decay}, use_metal_mask={use_metal_mask}")
     logger.info(f"feature_cols ({y_dim}): {feature_cols}")
 
     os.makedirs(output_dir, exist_ok=True)
@@ -255,7 +257,7 @@ def train_gaussian(config: dict,
 
     # ── Model ─────────────────────────────────────────────────────────────────────
     unet = GaussianUNet(
-        in_ch=3, out_ch=1,
+        in_ch=3 if use_metal_mask else 2, out_ch=1,
         base_ch=base_ch,
         t_emb_dim=t_emb_dim,
         y_dim=y_dim,
@@ -294,9 +296,12 @@ def train_gaussian(config: dict,
     _vis = [dataset[i] for i in range(_n_vis)]
     dataset.p_random_metal = _p_save
     _i_clean_vis = torch.stack([s['i_clean'] for s in _vis])
-    _m_metal_vis = torch.stack([s['m_metal'] for s in _vis])
-    sample_condition = torch.cat([_i_clean_vis, _m_metal_vis], dim=1).cpu()
-    del _vis, _i_clean_vis, _m_metal_vis
+    if use_metal_mask:
+        _m_metal_vis = torch.stack([s['m_metal'] for s in _vis])
+        sample_condition = torch.cat([_i_clean_vis, _m_metal_vis], dim=1).cpu()
+    else:
+        sample_condition = _i_clean_vis.cpu()
+    del _vis, _i_clean_vis
 
     # ── Training loop ─────────────────────────────────────────────────────────────
     for epoch in range(n_epochs):
@@ -312,7 +317,7 @@ def train_gaussian(config: dict,
             m_metal  = batch['m_metal'].to(device)   # [B, 1, H, W]
             y_i      = batch['y'].to(device)         # [B, 6]
 
-            condition = torch.cat([i_clean, m_metal], dim=1)  # [B, 2, H, W]
+            condition = torch.cat([i_clean, m_metal], dim=1) if use_metal_mask else i_clean
 
             # Sample y_target as a random row from the current batch's feature vectors.
             # Using torch.rand would land in empty regions of feature space (U[0,1]^F

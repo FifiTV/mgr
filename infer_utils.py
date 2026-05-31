@@ -65,13 +65,19 @@ def load_model(model_path: Path, cfg: dict,
             print(f'  WARNING: checkpoint y_dim={y_dim_ckpt} != config feature_cols={len(feature_cols)}. '
                   f'Using checkpoint value.')
         y_dim = y_dim_ckpt
-        # Truncate or pad feature_cols list to match checkpoint
         feature_cols = feature_cols[:y_dim]
     else:
         y_dim = len(feature_cols)
 
+    # Detect in_ch from enc_proj.weight: shape [out, in_ch, kH, kW]
+    _epw = next((v for k, v in _state_probe.items()
+                 if isinstance(v, torch.Tensor) and 'enc_proj.weight' in k), None)
+    in_ch = int(_epw.shape[1]) if _epw is not None else 3
+    if in_ch == 2:
+        print('  Checkpoint: in_ch=2 (no metal mask channel)')
+
     unet = GaussianUNet(
-        in_ch=3, out_ch=1,
+        in_ch=in_ch, out_ch=1,
         base_ch=gaus.get('base_channels', 64),
         t_emb_dim=gaus.get('t_emb_dim', 256),
         y_dim=y_dim,
@@ -135,8 +141,8 @@ def load_model(model_path: Path, cfg: dict,
     print(f'  Loaded: {load_path.name}  '
           f'params={sum(p.numel() for p in unet.parameters())//1000}k  '
           f'enc_proj |w|_mean={w_norm:.4f}  [{trained_hint}]')
-    print(f'  y_dim={y_dim}  features={feature_cols}')
-    return ddpm, feature_cols
+    print(f'  y_dim={y_dim}  features={feature_cols}  in_ch={in_ch}')
+    return ddpm, feature_cols, in_ch
 
 
 # ── Sampling ───────────────────────────────────────────────────────────────────

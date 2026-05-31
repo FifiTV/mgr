@@ -157,6 +157,7 @@ def process_sample(img_id: int,
                    stride: int,
                    device: torch.device,
                    out_dir: Path,
+                   use_metal_mask: bool = True,
                    seed: int = -1) -> None:
 
     i_clean_raw = load_raw(clean_path)
@@ -167,14 +168,13 @@ def process_sample(img_id: int,
     if m_metal_raw is not None:
         m_metal_n = (m_metal_raw > 0.5).astype(np.float32)
     elif i_art_raw is not None:
-        # Same fallback as gaussian_dataset._get_metal_mask: diff threshold
         m_metal_n = (np.abs(i_art_raw - i_clean_raw) > metal_threshold_hu).astype(np.float32)
     else:
         m_metal_n = np.zeros(SHAPE, dtype=np.float32)
 
     def t(arr): return torch.from_numpy(arr[None, None]).float().to(device)
 
-    condition = torch.cat([t(i_clean_n), t(m_metal_n)], dim=1)
+    condition = torch.cat([t(i_clean_n), t(m_metal_n)], dim=1) if use_metal_mask else t(i_clean_n)
     y_t       = torch.from_numpy(y_vec[None]).float().to(device)
 
     if seed >= 0:
@@ -439,7 +439,8 @@ def main():
 
     # ── Load model and features ────────────────────────────────────────────────
     print(f'Loading model: {model_path}')
-    ddpm, feature_cols = load_model(model_path, cfg, device)
+    ddpm, feature_cols, in_ch = load_model(model_path, cfg, device)
+    use_metal_mask = (in_ch == 3)
 
     # --feature-cols overrides auto-detected feature_cols (use for ablation models)
     if args.feature_cols:
@@ -516,6 +517,7 @@ def main():
             stride=args.stride,
             device=device,
             out_dir=args.out,
+            use_metal_mask=use_metal_mask,
             seed=args.seed + idx if args.seed >= 0 else -1,
         )
 
