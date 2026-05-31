@@ -141,6 +141,7 @@ def generate_samples(ddpm: GaussianDDPM,
         i_error_gen = ddpm.sample(cond, y_target)          # [B, 1, H, W]
 
         for i in range(B):
+            has_mask = cond.shape[1] == 2
             fig, axes = plt.subplots(1, 3, figsize=(12, 4))
             fig.suptitle(f'Epoch {epoch} | peak_amplitude={label} | sample {i}',
                          fontsize=11)
@@ -149,8 +150,13 @@ def generate_samples(ddpm: GaussianDDPM,
             axes[0].set_title('I_clean')
             axes[0].axis('off')
 
-            axes[1].imshow(cond[i, 1].cpu().numpy(), cmap='Reds', vmin=0, vmax=1)
-            axes[1].set_title('M_metal')
+            if has_mask:
+                axes[1].imshow(cond[i, 1].cpu().numpy(), cmap='Reds', vmin=0, vmax=1)
+                axes[1].set_title('M_metal')
+            else:
+                axes[1].set_title('M_metal (n/a)')
+                axes[1].text(0.5, 0.5, 'no mask', ha='center', va='center',
+                             transform=axes[1].transAxes, fontsize=10, color='gray')
             axes[1].axis('off')
 
             axes[2].imshow(i_error_gen[i, 0].cpu().numpy(), cmap='RdBu',
