@@ -80,11 +80,13 @@ def resolve_model_path(model_arg: Path | None, model_dir_arg: Path | None,
 
 def pick_anchor(body_dir: Path, img_id: int | None,
                 metal_threshold_hu: float,
-                device: torch.device) -> tuple[torch.Tensor, np.ndarray, int]:
+                device: torch.device,
+                use_metal_mask: bool = True) -> tuple[torch.Tensor, np.ndarray, int]:
     """Load one (I_clean, M_metal) pair as the fixed anchor for all cells.
 
     Returns:
-        condition  — [1, 2, H, W] tensor (I_clean_norm cat M_metal)
+        condition  — [1, 2, H, W] tensor (I_clean_norm cat M_metal) when use_metal_mask=True
+                     [1, 1, H, W] tensor (I_clean_norm only)         when use_metal_mask=False
         i_clean_n  — [H, W] numpy for optional reference display
         img_id_used
     """
@@ -125,7 +127,7 @@ def pick_anchor(body_dir: Path, img_id: int | None,
     def t(a: np.ndarray) -> torch.Tensor:
         return torch.from_numpy(a[None, None]).float().to(device)
 
-    condition = torch.cat([t(i_clean_n), t(m_metal_n)], dim=1)
+    condition = torch.cat([t(i_clean_n), t(m_metal_n)], dim=1) if use_metal_mask else t(i_clean_n)
     return condition, i_clean_n, iid
 
 
@@ -411,7 +413,8 @@ def main() -> None:
 
     # ── Model ──────────────────────────────────────────────────────────────────
     model_path            = resolve_model_path(args.model, args.model_dir, cfg)
-    ddpm, feature_cols    = load_model(model_path, cfg, device)
+    ddpm, feature_cols, in_ch = load_model(model_path, cfg, device)
+    use_metal_mask        = (in_ch == 3)
     ablate_features       = args.features if args.features else feature_cols
 
     # ── Features CSV → medians ─────────────────────────────────────────────────
@@ -425,7 +428,8 @@ def main() -> None:
     body_dir = rpi_base / args.body
     if not body_dir.exists():
         sys.exit(f'Body directory not found: {body_dir}')
-    condition, _, iid = pick_anchor(body_dir, args.img_id, metal_thr, device)
+    condition, _, iid = pick_anchor(body_dir, args.img_id, metal_thr, device,
+                                    use_metal_mask=use_metal_mask)
     print(f'Anchor: {args.body}/img{iid}')
 
     # ── Output path ────────────────────────────────────────────────────────────
