@@ -16,7 +16,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 from scipy.linalg import sqrtm
-from scipy.ndimage import binary_fill_holes
+from scipy.ndimage import binary_fill_holes, gaussian_filter
 from skimage.transform import radon, resize
 
 log = logging.getLogger(__name__)
@@ -286,3 +286,294 @@ def save_fid_csv(comparisons: dict[str, dict], out_path: Path):
     if rows:
         pd.DataFrame(rows).to_csv(out_path, index=False)
         log.info(f'Zapisano: {out_path}')
+
+
+# ── Pixel-level image quality metrics ─────────────────────────────────────────
+
+DATA_RANGE = 2.0   # images normalized to [-1, 1]
+
+# generated file suffix → which reference to compare against
+MODEL_SUFFIXES = {
+    "cyclegan_ab": "real_art",   # artifact generation → vs ground-truth artifact
+    "diffusion":   "real_art",   # artifact generation → vs ground-truth artifact
+    "cyclegan_ba": "clean",      # artifact removal    → vs clean CT
+}
+
+METRIC_NAMES_BASE  = ["ssim", "psnr", "mae", "gmsd"]
+METRIC_NAMES_LPIPS = METRIC_NAMES_BASE + ["lpips"]
+
+
+def normalize_hu(img: np.ndarray) -> np.ndarray:
+    """Per-image min-max normalization to [-1, 1] — identical to infer.py."""
+    lo, hi = img.min(), img.max()
+    return 2.0 * (img - lo) / (hi - lo) - 1.0 if hi - lo > 1e-5 else img
+
+
+def body_from_img_id(img_id: int) -> str:
+    """
+    Map img_id to RPI body folder name.
+    Convention: body1 = img1-1000, body2 = img1001-2000, ...
+    Formula: body_num = (img_id - 1) // 1000 + 1
+    Examples: img7001 → body8, img8001 → body9
+    """
+    return f"body{(img_id - 1) // 1000 + 1}"
+
+
+_RPI_TEMPLATES = {
+    "real_art": "Baseline/training_body_metalart_img{id}_512x512x1.raw",
+    "clean":    "Target/training_body_nometal_img{id}_512x512x1.raw",
+}
+
+
+def find_rpi_ref(rpi_dir: Path, img_id: int, ref_type: str) -> Path | None:
+    """Return path to RPI reference file, or None if not found.
+
+    Uses find_aapm_pair internally; ref_type is 'real_art' or 'clean'.
+    """
+    body = body_from_img_id(img_id)
+    pair = find_aapm_pair(rpi_dir, body, img_id)
+    if pair is None:
+        return None
+    art_path, clean_path = pair
+    return art_path if ref_type == "real_art" else clean_path
+
+
+# ── Generated-file discovery ──────────────────────────────────────────────────
+
+def find_gen_dir(variant_dir: Path) -> Path:
+    """
+    Find directory that contains the generated .raw files.
+    Layout A (infer.py): files are in variant/raw/
+    Layout B (flat):     files are in variant/ directly
+    """
+    raw_dir = variant_dir / "raw"
+    if raw_dir.exists():
+        for p in raw_dir.glob("*.raw"):
+            if any(p.stem.endswith(f"_{t}") for t in MODEL_SUFFIXES):
+                return raw_dir
+    for p in variant_dir.glob("*.raw"):
+        if any(p.stem.endswith(f"_{t}") for t in MODEL_SUFFIXES):
+            return variant_dir
+    return raw_dir  # fallback
+
+
+def find_ref_dir(variant_dir: Path) -> Path:
+    """
+    Find directory with reference .raw files when not using RPI.
+    Layout A: refs in variant/raw/img/
+    Layout B: refs in variant/raw/
+    """
+    img_dir = variant_dir / "raw" / "img"
+    if img_dir.exists() and any(img_dir.glob("*_real_art.raw")):
+        return img_dir
+    raw_dir = variant_dir / "raw"
+    if raw_dir.exists() and any(raw_dir.glob("*_real_art.raw")):
+        return raw_dir
+    return img_dir  # fallback
+
+
+def find_eval_pairs(variant_dir: Path,
+                    model_types: list[str],
+                    rpi_dir: Path | None) -> list[dict]:
+    """
+    Returns list of dicts:
+      variant, img_id, model_type, generated (Path), reference (Path),
+      ref_is_rpi (bool — True means reference needs normalize_hu before use)
+    """
+    gen_dir = find_gen_dir(variant_dir)
+    if not gen_dir.exists():
+        log.warning(f"Generated dir not found: {gen_dir}")
+        return []
+
+    ref_dir = None if rpi_dir else find_ref_dir(variant_dir)
+
+    pairs = []
+    for gen_path in sorted(gen_dir.glob("*.raw")):
+        stem = gen_path.stem
+
+        matched_type = None
+        for mtype in model_types:
+            if stem.endswith(f"_{mtype}"):
+                matched_type = mtype
+                break
+        if matched_type is None:
+            continue
+
+        m = re.search(r"img(\d+)", stem)
+        if not m:
+            log.warning(f"Cannot extract img_id from {gen_path.name}")
+            continue
+        img_id = int(m.group(1))
+
+        ref_type   = MODEL_SUFFIXES[matched_type]
+        ref_is_rpi = rpi_dir is not None
+
+        if rpi_dir:
+            ref_path = find_rpi_ref(rpi_dir, img_id, ref_type)
+            if ref_path is None:
+                body = body_from_img_id(img_id)
+                log.warning(f"RPI reference not found: img{img_id} ({ref_type}) "
+                            f"expected in {rpi_dir}/{body}/")
+                continue
+        else:
+            prefix   = stem[: -(len(matched_type) + 1)]
+            ref_path = ref_dir / f"{prefix}_{ref_type}.raw"
+            if not ref_path.exists():
+                log.warning(f"Reference not found: {ref_path.name}")
+                continue
+
+        pairs.append({
+            "variant":    variant_dir.name,
+            "img_id":     img_id,
+            "model_type": matched_type,
+            "generated":  gen_path,
+            "reference":  ref_path,
+            "ref_is_rpi": ref_is_rpi,
+        })
+
+    return pairs
+
+
+# ── Pixel-level metrics ───────────────────────────────────────────────────────
+
+def ssim(img1: np.ndarray, img2: np.ndarray,
+         data_range: float = DATA_RANGE, sigma: float = 1.5) -> float:
+    """SSIM with Gaussian window (sigma=1.5).
+
+    Numerically equivalent to skimage.metrics.structural_similarity(
+    gaussian_weights=True, sigma=1.5, data_range=data_range).
+    """
+    C1 = (0.01 * data_range) ** 2
+    C2 = (0.03 * data_range) ** 2
+    a, b = img1.astype(np.float64), img2.astype(np.float64)
+
+    mu_a, mu_b   = gaussian_filter(a, sigma), gaussian_filter(b, sigma)
+    mu_a2, mu_b2 = mu_a * mu_a, mu_b * mu_b
+    mu_ab        = mu_a * mu_b
+
+    sig_a2 = gaussian_filter(a * a, sigma) - mu_a2
+    sig_b2 = gaussian_filter(b * b, sigma) - mu_b2
+    sig_ab = gaussian_filter(a * b, sigma) - mu_ab
+
+    num = (2.0 * mu_ab + C1) * (2.0 * sig_ab + C2)
+    den = (mu_a2 + mu_b2 + C1) * (sig_a2 + sig_b2 + C2)
+    return float(np.mean(num / den))
+
+
+def psnr(img1: np.ndarray, img2: np.ndarray,
+         data_range: float = DATA_RANGE) -> float:
+    """Peak Signal-to-Noise Ratio [dB]. Higher = better."""
+    mse = float(np.mean((img1.astype(np.float64) - img2.astype(np.float64)) ** 2))
+    return float("inf") if mse == 0.0 else 10.0 * np.log10(data_range ** 2 / mse)
+
+
+def mae(img1: np.ndarray, img2: np.ndarray) -> float:
+    """Mean Absolute Error."""
+    return float(np.mean(np.abs(img1.astype(np.float64) - img2.astype(np.float64))))
+
+
+def gmsd(img1: np.ndarray, img2: np.ndarray) -> float:
+    """Gradient Magnitude Similarity Deviation. Lower = more similar.
+
+    c = 0.0026 * data_range² scales the original 8-bit constant to [-1,1] images.
+    """
+    c = 0.0026 * (DATA_RANGE ** 2)
+
+    def gm(img: np.ndarray) -> np.ndarray:
+        gx = np.abs(np.diff(img, axis=1, prepend=img[:, :1]))
+        gy = np.abs(np.diff(img, axis=0, prepend=img[:1, :]))
+        return np.sqrt(gx ** 2 + gy ** 2)
+
+    g1, g2  = gm(img1), gm(img2)
+    gms_map = (2.0 * g1 * g2 + c) / (g1 ** 2 + g2 ** 2 + c)
+    return float(gms_map.std())
+
+
+def compute_metrics(gen: np.ndarray, ref: np.ndarray,
+                    lpips_fn=None) -> dict:
+    """Compute all pixel-level metrics for one (generated, reference) pair."""
+    result = {
+        "ssim": ssim(gen, ref),
+        "psnr": psnr(gen, ref),
+        "mae":  mae(gen, ref),
+        "gmsd": gmsd(gen, ref),
+    }
+    if lpips_fn is not None:
+        result["lpips"] = lpips_fn(gen, ref)
+    return result
+
+
+def aggregate_metrics(scores: list[dict],
+                      metric_names: list[str]) -> dict:
+    """Compute mean / std / median for each metric over a list of score dicts."""
+    result = {}
+    for k in metric_names:
+        vals = np.array([s[k] for s in scores if k in s], dtype=np.float64)
+        if not len(vals):
+            continue
+        result[f"{k}_mean"]   = float(vals.mean())
+        result[f"{k}_std"]    = float(vals.std())
+        result[f"{k}_median"] = float(np.median(vals))
+    return result
+
+
+# ── LPIPS (VGG16 via torchvision — no extra package) ─────────────────────────
+
+class LPIPS_VGG:
+    """Simplified LPIPS using pretrained VGG16 features (torchvision).
+
+    Computes normalised L2 distance between multi-scale VGG16 activations.
+    Input images: numpy [H, W] float32 in [-1, 1].
+    """
+    _IMAGENET_MEAN = [0.485, 0.456, 0.406]
+    _IMAGENET_STD  = [0.229, 0.224, 0.225]
+    _LAYER_ENDS    = [4, 9, 16, 23]  # relu1_2, relu2_2, relu3_3, relu4_3
+
+    def __init__(self, device: str = "cpu"):
+        import torch
+        import torch.nn as nn
+        import torchvision.models as tvm
+        self.device = torch.device(device)
+        children = list(
+            tvm.vgg16(weights=tvm.VGG16_Weights.IMAGENET1K_V1)
+            .features.eval().children()
+        )
+        prev = 0
+        self.blocks = []
+        for end in self._LAYER_ENDS:
+            b = nn.Sequential(*children[prev:end]).to(self.device).eval()
+            for p in b.parameters():
+                p.requires_grad = False
+            self.blocks.append(b)
+            prev = end
+        mean = torch.tensor(self._IMAGENET_MEAN).view(1, 3, 1, 1).to(self.device)
+        std  = torch.tensor(self._IMAGENET_STD ).view(1, 3, 1, 1).to(self.device)
+        self._mean, self._std = mean, std
+
+    def _prep(self, img_np: np.ndarray):
+        import torch
+        t = torch.from_numpy(img_np).float().to(self.device)
+        t = (t + 1.0) / 2.0
+        t = t.unsqueeze(0).expand(3, -1, -1).unsqueeze(0)
+        return (t - self._mean) / self._std
+
+    def __call__(self, img1_np: np.ndarray, img2_np: np.ndarray) -> float:
+        import torch
+        x, y, total = self._prep(img1_np), self._prep(img2_np), 0.0
+        with torch.no_grad():
+            for block in self.blocks:
+                x, y = block(x), block(y)
+                norm = lambda f: f / f.pow(2).sum(1, keepdim=True).sqrt().clamp(1e-8)
+                total += float((norm(x) - norm(y)).pow(2).mean())
+        return total / len(self.blocks)
+
+
+def build_lpips(device: str) -> "LPIPS_VGG | None":
+    """Build LPIPS_VGG or return None if torchvision is unavailable."""
+    try:
+        inst = LPIPS_VGG(device=device)
+        log.info(f"LPIPS: VGG16 loaded on {device}")
+        return inst
+    except Exception as e:
+        log.warning(f"LPIPS unavailable: {e}")
+        return None
