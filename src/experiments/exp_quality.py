@@ -103,6 +103,11 @@ def main():
         help="Output directory for CSV results (default: results/eval)")
     grp_eval.add_argument("--no-lpips", action="store_true",
         help="Skip LPIPS (no internet/GPU needed).")
+    grp_eval.add_argument("--lpips-weights", type=Path, default=None,
+        help="Path to local VGG16 weights file (.pth).\n"
+             "If the file exists: loaded directly (no internet).\n"
+             "If missing: downloaded from PyTorch CDN to that path.\n"
+             "If omitted: torchvision uses ~/.cache/torch/hub/checkpoints/.")
     grp_eval.add_argument("--cpu", action="store_true",
         help="Force CPU for LPIPS.")
 
@@ -147,7 +152,7 @@ def main():
             dev = "cpu" if args.cpu else ("cuda" if torch.cuda.is_available() else "cpu")
         except ImportError:
             dev = "cpu"
-        lpips_fn     = build_lpips(dev)
+        lpips_fn     = build_lpips(dev, weights_path=args.lpips_weights)
         metric_names = METRIC_NAMES_LPIPS if lpips_fn else METRIC_NAMES_BASE
 
     rpi_dir = args.rpi_dir

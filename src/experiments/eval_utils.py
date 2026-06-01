@@ -519,25 +519,54 @@ def aggregate_metrics(scores: list[dict],
 
 # ── LPIPS (VGG16 via torchvision — no extra package) ─────────────────────────
 
+_VGG16_URL = "https://download.pytorch.org/models/vgg16-397923af.pth"
+
+
 class LPIPS_VGG:
     """Simplified LPIPS using pretrained VGG16 features (torchvision).
 
     Computes normalised L2 distance between multi-scale VGG16 activations.
     Input images: numpy [H, W] float32 in [-1, 1].
+
+    weights_path: optional path to a local vgg16 .pth file.
+      - If the file exists there: loaded directly (no internet needed).
+      - If the path is given but missing: downloaded from PyTorch CDN to that path.
+      - If None: torchvision downloads to ~/.cache/torch/hub/checkpoints/ as usual.
     """
     _IMAGENET_MEAN = [0.485, 0.456, 0.406]
     _IMAGENET_STD  = [0.229, 0.224, 0.225]
     _LAYER_ENDS    = [4, 9, 16, 23]  # relu1_2, relu2_2, relu3_3, relu4_3
 
-    def __init__(self, device: str = "cpu"):
+    def __init__(self, device: str = "cpu",
+                 weights_path: Path | None = None):
         import torch
         import torch.nn as nn
         import torchvision.models as tvm
         self.device = torch.device(device)
-        children = list(
-            tvm.vgg16(weights=tvm.VGG16_Weights.IMAGENET1K_V1)
-            .features.eval().children()
-        )
+
+        if weights_path is not None:
+            weights_path = Path(weights_path)
+            if not weights_path.exists():
+                log.info(f"VGG16 weights not found at {weights_path} — downloading...")
+                weights_path.parent.mkdir(parents=True, exist_ok=True)
+                torch.hub.download_url_to_file(_VGG16_URL, str(weights_path))
+                log.info(f"Saved to {weights_path}")
+            else:
+                log.info(f"Loading VGG16 weights from {weights_path}")
+            vgg = tvm.vgg16(weights=None)
+            vgg.load_state_dict(
+                torch.load(weights_path, map_location="cpu", weights_only=True)
+            )
+            vgg_feat = vgg.features.to(self.device).eval()
+        else:
+            vgg_feat = tvm.vgg16(
+                weights=tvm.VGG16_Weights.IMAGENET1K_V1
+            ).features.to(self.device).eval()
+
+        for p in vgg_feat.parameters():
+            p.requires_grad = False
+
+        children = list(vgg_feat.children())
         prev = 0
         self.blocks = []
         for end in self._LAYER_ENDS:
@@ -546,6 +575,7 @@ class LPIPS_VGG:
                 p.requires_grad = False
             self.blocks.append(b)
             prev = end
+
         mean = torch.tensor(self._IMAGENET_MEAN).view(1, 3, 1, 1).to(self.device)
         std  = torch.tensor(self._IMAGENET_STD ).view(1, 3, 1, 1).to(self.device)
         self._mean, self._std = mean, std
@@ -568,11 +598,16 @@ class LPIPS_VGG:
         return total / len(self.blocks)
 
 
-def build_lpips(device: str) -> "LPIPS_VGG | None":
-    """Build LPIPS_VGG or return None if torchvision is unavailable."""
+def build_lpips(device: str,
+                weights_path: Path | None = None) -> "LPIPS_VGG | None":
+    """Build LPIPS_VGG or return None on failure.
+
+    weights_path: local .pth file; downloaded there if missing.
+                  If None, torchvision uses its default cache.
+    """
     try:
-        inst = LPIPS_VGG(device=device)
-        log.info(f"LPIPS: VGG16 loaded on {device}")
+        inst = LPIPS_VGG(device=device, weights_path=weights_path)
+        log.info(f"LPIPS: VGG16 ready on {device}")
         return inst
     except Exception as e:
         log.warning(f"LPIPS unavailable: {e}")
