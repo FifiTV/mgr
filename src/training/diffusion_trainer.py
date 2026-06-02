@@ -5,6 +5,7 @@ Diffusion Model training module.
 import logging
 import os
 import json
+from pathlib import Path
 import torch
 import torch.optim as optim
 from torch.optim.lr_scheduler import CosineAnnealingLR
@@ -79,7 +80,8 @@ class EMA:
 def train_diffusion(dataloader_soft: DataLoader, dataloader_hard: DataLoader,
                     config: dict, device: torch.device,
                     output_dir: str,
-                    label_mode: str = None) -> None:
+                    label_mode: str = None,
+                    resume_from: str = None) -> None:
     """
     Train Diffusion model with soft and hard labels.
 
@@ -90,6 +92,10 @@ def train_diffusion(dataloader_soft: DataLoader, dataloader_hard: DataLoader,
         device: Computation device (cuda/cpu)
         output_dir: Directory to save model checkpoints
         label_mode: Train only 'soft' or 'hard'. Default: train both.
+        resume_from: Output dir to resume from (same as output_dir usually).
+                     Loads latest checkpoint from
+                     <resume_from>/checkpoints/diffusion/<mode>/latest/.
+                     --epochs in config must be the TOTAL target epoch count.
     """
     logger.info("=" * 60)
     logger.info("Starting Diffusion Model Training")
@@ -132,11 +138,59 @@ def train_diffusion(dataloader_soft: DataLoader, dataloader_hard: DataLoader,
         scaler    = torch.amp.GradScaler('cuda') if torch.cuda.is_available() else None
         ema       = EMA(diffusion.model, decay=ema_decay)
 
-        history = {'loss': []}
+        history     = {'loss': []}
         total_steps = 0
+        start_epoch = 0
         _last_real_A = _last_real_B = _last_mask_M = _last_mask_A = _last_cond = None
 
-        for epoch in range(epochs):
+        # --- Resume from checkpoint ---
+        if resume_from is not None:
+            ckpt_dir = Path(resume_from) / 'checkpoints' / 'diffusion' / mode_name.lower() / 'latest'
+            if not ckpt_dir.exists():
+                logger.warning(f"  Resume dir not found: {ckpt_dir} — starting from scratch")
+            else:
+                logger.info(f"  Resuming {mode_name} from {ckpt_dir}")
+
+                meta_path = ckpt_dir / 'meta.json'
+                if meta_path.exists():
+                    with open(meta_path) as f:
+                        meta = json.load(f)
+                    start_epoch        = meta.get('epoch', 0)
+                    total_steps        = meta.get('total_steps', 0)
+                    history['loss']    = meta.get('history_loss', [])
+                    logger.info(f"  start_epoch={start_epoch}  total_steps={total_steps}")
+
+                model_path = ckpt_dir / 'model.pth'
+                if model_path.exists():
+                    state = torch.load(model_path, map_location=device, weights_only=True)
+                    diffusion.model.load_state_dict(state)
+                    logger.info(f"  Loaded model weights")
+
+                ema_path = ckpt_dir / 'model_ema.pth'
+                if ema_path.exists():
+                    ema.shadow = torch.load(ema_path, map_location='cpu', weights_only=True)
+                    logger.info(f"  Loaded EMA weights")
+
+                opt_path = ckpt_dir / 'optimizer.pth'
+                if opt_path.exists():
+                    optimizer.load_state_dict(
+                        torch.load(opt_path, map_location=device, weights_only=False))
+                    logger.info(f"  Loaded optimizer state")
+
+                sched_path = ckpt_dir / 'scheduler.pth'
+                if sched_path.exists():
+                    scheduler.load_state_dict(
+                        torch.load(sched_path, map_location='cpu', weights_only=False))
+                    logger.info(f"  Loaded scheduler state")
+
+                if start_epoch >= epochs:
+                    logger.info(
+                        f"  Already at epoch {start_epoch}/{epochs} — nothing to do. "
+                        f"Increase --epochs (total target) to train more."
+                    )
+                    continue
+
+        for epoch in range(start_epoch, epochs):
             epoch_loss = 0.0
             diffusion.train()
 
@@ -226,6 +280,14 @@ def train_diffusion(dataloader_soft: DataLoader, dataloader_hard: DataLoader,
             os.makedirs(latest_dir, exist_ok=True)
             torch.save(diffusion.model.state_dict(), os.path.join(latest_dir, 'model.pth'))
             torch.save(ema.state_dict(),             os.path.join(latest_dir, 'model_ema.pth'))
+            torch.save(optimizer.state_dict(),       os.path.join(latest_dir, 'optimizer.pth'))
+            torch.save(scheduler.state_dict(),       os.path.join(latest_dir, 'scheduler.pth'))
+            with open(os.path.join(latest_dir, 'meta.json'), 'w') as _f:
+                json.dump({
+                    'epoch':        epoch + 1,
+                    'total_steps':  total_steps,
+                    'history_loss': history['loss'],
+                }, _f)
 
             # Save periodic checkpoint every checkpoint_interval epochs (0 = disabled)
             if checkpoint_interval > 0 and (epoch + 1) % checkpoint_interval == 0:

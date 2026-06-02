@@ -489,14 +489,50 @@ def gmsd(img1: np.ndarray, img2: np.ndarray) -> float:
     return float(gms_map.std())
 
 
+def check_and_clip_gen(gen: np.ndarray,
+                        name: str = "") -> tuple[np.ndarray, dict]:
+    """Clip generated image to [-1, 1] and return (clipped, diagnostics).
+
+    Generated images should always be in [-1, 1] (model output clamped in
+    infer.py). Values outside this range indicate the inference was run
+    without the clamp fix — they are artefacts of the DDPM reverse process,
+    not meaningful image content. Clipping corrects for this before metrics.
+
+    Returns a diagnostics dict with:
+      gen_min, gen_max, gen_mean  — original statistics
+      oor_pct                     — percentage of pixels outside [-1, 1]
+    """
+    diag = {
+        "gen_min":  float(gen.min()),
+        "gen_max":  float(gen.max()),
+        "gen_mean": float(gen.mean()),
+        "oor_pct":  float(((gen < -1) | (gen > 1)).mean() * 100),
+    }
+    if diag["oor_pct"] > 0:
+        tag = f" [{name}]" if name else ""
+        log.warning(
+            f"Generated image{tag} has {diag['oor_pct']:.1f}% pixels outside [-1,1] "
+            f"(min={diag['gen_min']:.3f}, max={diag['gen_max']:.3f}). "
+            f"Clamping — inference was likely run without x.clamp(-1,1) fix."
+        )
+    return np.clip(gen, -1.0, 1.0), diag
+
+
 def compute_metrics(gen: np.ndarray, ref: np.ndarray,
-                    lpips_fn=None) -> dict:
-    """Compute all pixel-level metrics for one (generated, reference) pair."""
+                    lpips_fn=None,
+                    name: str = "") -> dict:
+    """Compute all pixel-level metrics for one (generated, reference) pair.
+
+    Clips generated image to [-1, 1] before comparison (safety measure for
+    inference runs without the clamp fix). Returns diagnostics in the result.
+    """
+    gen, diag = check_and_clip_gen(gen, name=name)
     result = {
         "ssim": ssim(gen, ref),
         "psnr": psnr(gen, ref),
         "mae":  mae(gen, ref),
         "gmsd": gmsd(gen, ref),
+        **diag,   # gen_min, gen_max, gen_mean, oor_pct
     }
     if lpips_fn is not None:
         result["lpips"] = lpips_fn(gen, ref)

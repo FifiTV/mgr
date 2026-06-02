@@ -87,19 +87,9 @@ class CTDataset(Dataset):
         return arr
 
     def normalize_hu(self, img: np.ndarray) -> np.ndarray:
-        """
-        Normalize CT image from HU range to [-1, 1].
-        
-        Args:
-            img: Input image
-            
-        Returns:
-            Normalized image
-        """
-        min_val, max_val = img.min(), img.max()
-        if max_val - min_val > 1e-5:
-            return 2 * (img - min_val) / (max_val - min_val) - 1
-        return img
+        """Clip to [-1000, 3000] HU and scale to [-1, 1] — global range, consistent with gaussian_dataset."""
+        img = np.clip(img, -1000.0, 3000.0)
+        return (img + 1000.0) / 4000.0 * 2.0 - 1.0
 
     def compute_soft_mask(self, diff_raw: np.ndarray) -> np.ndarray:
         """
