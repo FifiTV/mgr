@@ -56,18 +56,29 @@ def save_raw_outputs(
     i_clean_raw: np.ndarray,
     i_art_raw: np.ndarray | None,
 ) -> None:
-    """Save generated maps as float32 .raw files (512x512 each)."""
+    """Save generated maps as float32 .raw files (512x512 each).
+
+    All CT images normalized via global clip [-1000, 3000] -> [-1, 1] (same as
+    infer.py and gaussian_dataset.normalize_ct), so files from all models are
+    directly comparable.
+
+    Layout:
+      raw/           — model outputs
+        stem_gen_error.raw   error map  (already [-1,1] from model)
+        stem_gen_ct.raw      reconstructed artifact CT, normalized [-1,1]
+      raw/img/       — inputs / references (global HU -> [-1,1])
+        stem_clean.raw
+        stem_real_art.raw
+    """
     raw_dir = out_dir / 'raw'
     img_dir = raw_dir / 'img'
     img_dir.mkdir(parents=True, exist_ok=True)
 
-    # Model output — lives in raw/ directly
     (raw_dir / f'{stem}_gen_error.raw').write_bytes(i_error_gen.astype(np.float32).tobytes())
-    # Derived images — lives in raw/img/
-    (img_dir / f'{stem}_clean.raw').write_bytes(i_clean_raw.astype(np.float32).tobytes())
-    (img_dir / f'{stem}_gen_ct.raw').write_bytes(i_metal_gen_hu.astype(np.float32).tobytes())
+    (raw_dir / f'{stem}_gen_ct.raw').write_bytes(normalize_ct(i_metal_gen_hu).tobytes())
+    (img_dir / f'{stem}_clean.raw').write_bytes(normalize_ct(i_clean_raw).tobytes())
     if i_art_raw is not None:
-        (img_dir / f'{stem}_real_art.raw').write_bytes(i_art_raw.astype(np.float32).tobytes())
+        (img_dir / f'{stem}_real_art.raw').write_bytes(normalize_ct(i_art_raw).tobytes())
 
 
 def save_metadata(
@@ -195,9 +206,7 @@ def process_sample(img_id: int,
     panels.append((m_metal_n,   'M_metal\n(metal mask)',   'hot',  (0, 1)))
     panels.append((i_error_gen, 'Gen I_error\n(model output)', 'RdBu', (-1, 1)))
 
-    i_metal_gen_vis = np.clip(i_metal_gen_hu, -1000, 3000)
-    i_metal_gen_vis = (i_metal_gen_vis - (-1000)) / (3000 - (-1000)) * 2 - 1
-    panels.append((i_metal_gen_vis, 'Gen CT\n(I_clean + gen artifact)', 'gray', (-1, 1)))
+    panels.append((normalize_ct(i_metal_gen_hu), 'Gen CT\n(I_clean + gen artifact)', 'gray', (-1, 1)))
 
     overlay_base     = (i_clean_n + 1) / 2
     artifact_overlay = np.clip(i_error_gen, 0, 1)
@@ -211,10 +220,8 @@ def process_sample(img_id: int,
     if i_art_raw is not None:
         i_error_real   = i_art_raw - i_clean_raw
         i_error_real_n = np.clip(i_error_real, -error_scale, error_scale) / error_scale
-        i_art_vis      = np.clip(i_art_raw, -1000, 3000)
-        i_art_vis      = (i_art_vis - (-1000)) / (3000 - (-1000)) * 2 - 1
-        panels.append((i_error_real_n, 'Real I_error\n(ground truth)', 'RdBu', (-1, 1)))
-        panels.append((i_art_vis,      'Real CT\n(I_metal gt)',         'gray',  (-1, 1)))
+        panels.append((i_error_real_n,         'Real I_error\n(ground truth)', 'RdBu', (-1, 1)))
+        panels.append((normalize_ct(i_art_raw), 'Real CT\n(I_metal gt)',        'gray',  (-1, 1)))
 
     # ── Feature subtitle ───────────────────────────────────────────────────────
     feat_str  = '  '.join(f'{c[:6]}={v:.2f}' for c, v in zip(feature_cols, y_vec))

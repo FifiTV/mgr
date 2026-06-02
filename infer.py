@@ -60,10 +60,9 @@ def load_raw(path: Path, shape: tuple = (512, 512)) -> np.ndarray:
 
 
 def normalize_hu(img: np.ndarray) -> np.ndarray:
-    lo, hi = img.min(), img.max()
-    if hi - lo > 1e-5:
-        return 2.0 * (img - lo) / (hi - lo) - 1.0
-    return img
+    """Clip to [-1000, 3000] HU and scale to [-1, 1] — global range, same as gaussian_dataset.normalize_ct."""
+    img = np.clip(img, -1000.0, 3000.0)
+    return (img + 1000.0) / 4000.0 * 2.0 - 1.0
 
 
 def to_tensor(arr: np.ndarray, device: torch.device) -> torch.Tensor:
@@ -221,9 +220,14 @@ def save_figure(panels: list[tuple[np.ndarray, str]],
         axes = [axes]
 
     for ax, (img, label) in zip(axes, panels):
-        vmin, vmax = (-1, 1) if img.min() < 0 else (0, 1)
-        cmap = "gray" if img.min() < 0 else "hot"
-        ax.imshow(img, cmap=cmap, vmin=vmin, vmax=vmax)
+        if img.min() >= 0:
+            # Masks (artifact mask, metal mask) — hot colormap, fixed [0,1]
+            ax.imshow(img, cmap="hot", vmin=0, vmax=1)
+        else:
+            # CT images — use 2nd–98th percentile window so structures are visible
+            # even when metal spikes compress the range to near-black at fixed [-1,1]
+            p2, p98 = np.percentile(img, 2), np.percentile(img, 98)
+            ax.imshow(img, cmap="gray", vmin=p2, vmax=p98)
         ax.set_title(label, fontsize=9, fontweight="bold")
         ax.axis("off")
 
@@ -260,14 +264,14 @@ def save_infer_raw(
     out_dir: Path,
     stem: str,
     generated: dict,
-    clean_np: "np.ndarray | None",
-    art_np: "np.ndarray | None",
+    clean_raw: "np.ndarray | None",
+    art_raw: "np.ndarray | None",
 ) -> None:
     """Save generated images and inputs as float32 .raw files (512×512).
 
-    Layout mirrors infer_gaussian.py:
-      out_dir/raw/          — model outputs (generated images)
-      out_dir/raw/img/      — input images (clean, real artifact)
+    Layout mirrors infer_gaussian.py save_raw_outputs:
+      out_dir/raw/          — model outputs (generated), already in [-1, 1]
+      out_dir/raw/img/      — input images normalized with global clip [-1000, 3000] -> [-1, 1]
     """
     raw_dir = out_dir / "raw"
     img_dir = raw_dir / "img"
@@ -278,10 +282,10 @@ def save_infer_raw(
         path.write_bytes(arr.astype(np.float32).tobytes())
         print(f"  -> {path}")
 
-    if clean_np is not None:
-        (img_dir / f"{stem}_clean.raw").write_bytes(clean_np.astype(np.float32).tobytes())
-    if art_np is not None:
-        (img_dir / f"{stem}_real_art.raw").write_bytes(art_np.astype(np.float32).tobytes())
+    if clean_raw is not None:
+        (img_dir / f"{stem}_clean.raw").write_bytes(normalize_hu(clean_raw).tobytes())
+    if art_raw is not None:
+        (img_dir / f"{stem}_real_art.raw").write_bytes(normalize_hu(art_raw).tobytes())
 
 
 # -- Per-sample processing -----------------------------------------------------
@@ -304,8 +308,13 @@ def process_pair(clean_path: Path | None,
     has_clean = clean_path is not None
     has_art   = art_path is not None
 
-    clean_np = normalize_hu(load_raw(clean_path)) if has_clean else None
-    art_np   = normalize_hu(load_raw(art_path))   if has_art   else None
+    # Load raw HU once — used for masks, for model input (after normalisation),
+    # and for saving reference files (same as infer_gaussian.py saves raw HU)
+    clean_raw = load_raw(clean_path) if has_clean else None
+    art_raw   = load_raw(art_path)   if has_art   else None
+
+    clean_np = normalize_hu(clean_raw) if has_clean else None
+    art_np   = normalize_hu(art_raw)   if has_art   else None
 
     clean_t = to_tensor(clean_np, device) if has_clean else None
     art_t   = to_tensor(art_np,   device) if has_art   else None
@@ -320,9 +329,7 @@ def process_pair(clean_path: Path | None,
             mask_m_t = mask_a_t = None
         mask_m_np = mask_a_np = None
     elif has_clean and has_art:
-        mask_m_np, mask_a_np = compute_masks(
-            load_raw(clean_path), load_raw(art_path), cfg, bloom_max
-        )
+        mask_m_np, mask_a_np = compute_masks(clean_raw, art_raw, cfg, bloom_max)
         mask_m_t = to_tensor(mask_m_np, device)
         mask_a_t = to_tensor(mask_a_np, device)
     else:
@@ -379,7 +386,7 @@ def process_pair(clean_path: Path | None,
     stem = (art_path or clean_path).stem[:30]
     save_figure(panels, stem, out_dir / f"infer_{idx:04d}_{stem}.png")
     if generated:
-        save_infer_raw(out_dir, f"infer_{idx:04d}_{stem}", generated, clean_np, art_np)
+        save_infer_raw(out_dir, f"infer_{idx:04d}_{stem}", generated, clean_raw, art_raw)
 
 
 # -- CLI -----------------------------------------------------------------------
