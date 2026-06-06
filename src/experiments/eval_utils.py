@@ -17,7 +17,7 @@ import numpy as np
 import pandas as pd
 from scipy.linalg import sqrtm
 from scipy.ndimage import binary_fill_holes, gaussian_filter
-from skimage.transform import radon, resize
+from skimage.transform import radon
 
 log = logging.getLogger(__name__)
 
@@ -180,46 +180,67 @@ def sinogram_stat_features(img: np.ndarray) -> np.ndarray:
 
 # ── RadImageNet FID (opcjonalne) ────────────────────────────────────────────────
 
-def radimagenet_features(images: list[np.ndarray], weights_path: Path,
-                          device_str: str = 'auto') -> np.ndarray:
-    """Wyciągnij 2048D cechy z RadImageNet ResNet50.
-
-    images: lista tablic HU (512×512) — mogą to być pełne CT lub sinogramy.
-    Zwraca: (N, 2048) float32.
-    """
+def _load_resnet50_backbone(weights_path: Path | None,
+                             device: 'torch.device') -> 'torch.nn.Module':
+    """Load ResNet50 backbone (ImageNet or RadImageNet), strip FC, move to device."""
     import torch
     import torchvision.models as tv_models
 
-    device = (torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-              if device_str == 'auto' else torch.device(device_str))
-
-    obj = torch.load(weights_path, map_location='cpu', weights_only=False)
-    if isinstance(obj, torch.nn.Module):
-        # Full model saved with torch.save(model, ...) — Lab-Rasool/RadImageNet format
-        backbone = obj
+    if weights_path is None:
+        backbone = tv_models.resnet50(weights=tv_models.ResNet50_Weights.IMAGENET1K_V1)
+        log.info('ImageNet weights loaded from torchvision cache')
     else:
-        # State dict — load into a fresh ResNet50
-        backbone = tv_models.resnet50()
-        backbone.load_state_dict(obj, strict=False)
+        obj = torch.load(weights_path, map_location='cpu', weights_only=False)
+        if isinstance(obj, torch.nn.Module):
+            backbone = obj                           # full model (RadImageNet format)
+        else:
+            backbone = tv_models.resnet50()
+            backbone.load_state_dict(obj, strict=False)
+        log.info(f'Weights loaded from {weights_path}')
+
     if hasattr(backbone, 'fc'):
         backbone.fc = torch.nn.Identity()
-    backbone.eval().to(device)
+    return backbone.eval().to(device)
+
+
+def _extract_resnet_features(images: list[np.ndarray],
+                              backbone: 'torch.nn.Module',
+                              device: 'torch.device') -> np.ndarray:
+    """Run images through backbone and return (N, D) feature matrix.
+
+    Expects images already normalised to [0, 1] (done by _hu_norm in
+    eval_generated._prepare_ct_images).  Only applies ImageNet channel
+    mean/std — no further value-range transformation.
+    """
+    import torch
+    from skimage.transform import resize as sk_resize
 
     mean = torch.tensor([0.485, 0.456, 0.406], device=device).view(1, 3, 1, 1)
     std  = torch.tensor([0.229, 0.224, 0.225], device=device).view(1, 3, 1, 1)
 
     feats = []
     for img in images:
-        # Normalizuj do [0,1], resize 224×224, powiel do 3 kanałów
-        lo, hi = img.min(), img.max()
-        img_n = (img - lo) / (hi - lo + 1e-6)
-        img_r = resize(img_n, (224, 224), anti_aliasing=True)
+        img_r = sk_resize(img, (224, 224), anti_aliasing=True)
         t = torch.from_numpy(img_r).float().unsqueeze(0).repeat(3, 1, 1).unsqueeze(0)
         t = (t.to(device) - mean) / std
         with torch.no_grad():
             feats.append(backbone(t).squeeze().cpu().numpy())
-
     return np.array(feats, dtype=np.float32)
+
+
+def radimagenet_features(images: list[np.ndarray], weights_path: Path,
+                          device_str: str = 'auto') -> np.ndarray:
+    """Extract 2048D features from RadImageNet ResNet50.
+
+    images: arrays already normalised to [0, 1] by _hu_norm (fixed HU window).
+    No internal per-image normalisation — caller is responsible for consistent scaling.
+    Returns (N, 2048) float32.
+    """
+    import torch
+    device   = (torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+                if device_str == 'auto' else torch.device(device_str))
+    backbone = _load_resnet50_backbone(weights_path, device)
+    return _extract_resnet_features(images, backbone, device)
 
 
 def imagenet_features(images: list[np.ndarray],
@@ -227,44 +248,17 @@ def imagenet_features(images: list[np.ndarray],
                       device_str: str = 'auto') -> np.ndarray:
     """Extract 2048D features from ResNet50 pretrained on ImageNet.
 
-    Standard FID baseline — compare against Med-FID (RadImageNet).
-    Normalization: HU clip [-1000, 3000] → [0, 1] (fixed window, not per-image).
+    images: arrays already normalised to [0, 1] by _hu_norm (fixed HU window).
+    No internal per-image normalisation — caller is responsible for consistent scaling.
 
-    weights_path: optional local .pth file. If None, torchvision downloads automatically
-                  to ~/.cache/torch/hub/checkpoints/ (requires internet on first run).
+    weights_path: optional local .pth file. If None, torchvision uses cache.
+    Returns (N, 2048) float32.
     """
     import torch
-    import torchvision.models as tv_models
-
-    device = (torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-              if device_str == 'auto' else torch.device(device_str))
-
-    backbone = tv_models.resnet50()
-    if weights_path is not None and Path(weights_path).exists():
-        state = torch.load(weights_path, map_location='cpu', weights_only=True)
-        backbone.load_state_dict(state)
-        log.info(f'ImageNet weights loaded from {weights_path}')
-    else:
-        # Automatic download via torchvision (cached in ~/.cache/torch/hub/checkpoints/)
-        backbone = tv_models.resnet50(weights=tv_models.ResNet50_Weights.IMAGENET1K_V1)
-        log.info('ImageNet weights loaded from torchvision cache')
-    backbone.fc = torch.nn.Identity()
-    backbone.eval().to(device)
-
-    mean = torch.tensor([0.485, 0.456, 0.406], device=device).view(1, 3, 1, 1)
-    std  = torch.tensor([0.229, 0.224, 0.225], device=device).view(1, 3, 1, 1)
-
-    feats = []
-    for img in images:
-        # Fixed HU window [-1000, 3000] → [0, 1] (same for all images, unlike per-image min/max)
-        img_norm = (np.clip(img, -1000.0, 3000.0) + 1000.0) / 4000.0
-        img_r = resize(img_norm, (224, 224), anti_aliasing=True)
-        t = torch.from_numpy(img_r).float().unsqueeze(0).repeat(3, 1, 1).unsqueeze(0)
-        t = (t.to(device) - mean) / std
-        with torch.no_grad():
-            feats.append(backbone(t).squeeze().cpu().numpy())
-
-    return np.array(feats, dtype=np.float32)
+    device   = (torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+                if device_str == 'auto' else torch.device(device_str))
+    backbone = _load_resnet50_backbone(weights_path, device)
+    return _extract_resnet_features(images, backbone, device)
 
 
 def sinogram_images(images: list[np.ndarray]) -> list[np.ndarray]:
