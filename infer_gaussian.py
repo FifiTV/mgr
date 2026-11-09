@@ -26,6 +26,17 @@ Examples:
 
   # CPU
   python infer_gaussian.py --body body1 --n 3 --cpu
+
+  # Prior model (use_prior=True in its model_config.json): I_prior is computed from
+  # each sample's metal mask with the SAME function and parameters as in training
+  # (read from the checkpoint's model_config, never hardcoded).
+  python infer_gaussian.py --model results/models/gaussian_prior/gaussian_unet_ema.pth --body body8
+
+  # Custom implant layout: one mask for all selected samples (.raw 512x512 float32 or .npy)
+  python infer_gaussian.py --model ... --body body8 --n 4 --mask-file my_implants.npy
+
+  # Ready-made I_prior (already in model-input scale, i.e. what the dataset returns)
+  python infer_gaussian.py --model ... --body body8 --n 4 --prior-file my_prior.npy
 """
 
 import argparse
@@ -43,7 +54,20 @@ import torch
 sys.path.insert(0, str(Path(__file__).parent))
 
 from src.datasets.gaussian_dataset import load_features_df, normalize_ct, normalize_error
-from infer_utils import SHAPE, load_config, load_raw, load_model, ddpm_sample, GaussianDDPM
+from src.physics.artifact_prior import PriorParams, finalize_prior, unit_prior
+from src.physics.metal_mask import METAL_MASK_DIRS, find_metal_mask, load_binary_metal_mask
+from infer_utils import (SHAPE, load_config, load_raw, load_model, load_model_config,
+                         ddpm_sample, GaussianDDPM)
+
+
+def load_array(path: Path) -> np.ndarray:
+    """Load a 512x512 map from .npy or .raw (float32)."""
+    path = Path(path)
+    arr = np.load(path) if path.suffix == '.npy' else load_raw(path)
+    arr = np.asarray(arr, dtype=np.float32)
+    if arr.shape != SHAPE:
+        sys.exit(f'{path}: expected shape {SHAPE}, got {arr.shape}')
+    return arr
 
 
 # ── Raw output saving ─────────────────────────────────────────────────────────
@@ -91,6 +115,7 @@ def save_metadata(
     error_scale: float,
     seed: int,
     metalinfo: dict | None,
+    extra: dict | None = None,
 ) -> None:
     """Save inference metadata alongside the raw model output."""
     raw_dir = out_dir / 'raw'
@@ -119,6 +144,8 @@ def save_metadata(
     }
     if metalinfo is not None:
         meta['metalinfo'] = metalinfo
+    if extra:
+        meta.update(extra)
 
     path = raw_dir / f'{stem}.json'
     path.write_text(json.dumps(meta, indent=2, ensure_ascii=False), encoding='utf-8')
@@ -169,23 +196,41 @@ def process_sample(img_id: int,
                    device: torch.device,
                    out_dir: Path,
                    use_metal_mask: bool = True,
-                   seed: int = -1) -> None:
+                   seed: int = -1,
+                   prior_params: PriorParams | None = None,
+                   mask_override: np.ndarray | None = None,
+                   prior_override: np.ndarray | None = None) -> None:
+    """prior_params != None -> prior model: 3rd channel = I_prior computed from the
+    metal mask (override > metalonlymask file > HU threshold) with the training params."""
 
     i_clean_raw = load_raw(clean_path)
     i_art_raw   = load_raw(art_path)   if art_path   else None
-    m_metal_raw = load_raw(metal_path) if metal_path else None
 
     i_clean_n = normalize_ct(i_clean_raw)
-    if m_metal_raw is not None:
-        m_metal_n = (m_metal_raw > 0.5).astype(np.float32)
-    elif i_art_raw is not None:
-        m_metal_n = (np.abs(i_art_raw - i_clean_raw) > metal_threshold_hu).astype(np.float32)
+    if mask_override is not None:
+        m_metal_n, mask_source = (mask_override > 0.5).astype(np.float32), 'mask-file'
+    elif metal_path is not None or i_art_raw is not None:
+        m_bool, mask_source = load_binary_metal_mask(metal_path, art_path, clean_path,
+                                                     metal_threshold_hu)
+        m_metal_n = m_bool.astype(np.float32)
     else:
-        m_metal_n = np.zeros(SHAPE, dtype=np.float32)
+        m_metal_n, mask_source = np.zeros(SHAPE, dtype=np.float32), 'none'
 
     def t(arr): return torch.from_numpy(arr[None, None]).float().to(device)
 
-    condition = torch.cat([t(i_clean_n), t(m_metal_n)], dim=1) if use_metal_mask else t(i_clean_n)
+    i_prior, extra_meta = None, {'metal_mask_source': mask_source}
+    if prior_params is not None:
+        if prior_override is not None:
+            i_prior, prior_source = prior_override.astype(np.float32), 'prior-file'
+        else:
+            unit, scale = unit_prior(m_metal_n, prior_params)
+            i_prior, prior_source = finalize_prior(unit, scale, prior_params), 'computed'
+        extra_meta.update({'prior_source': prior_source, 'prior_params': prior_params.to_dict()})
+        condition = torch.cat([t(i_clean_n), t(i_prior)], dim=1)
+    elif use_metal_mask:
+        condition = torch.cat([t(i_clean_n), t(m_metal_n)], dim=1)
+    else:
+        condition = t(i_clean_n)
     y_t       = torch.from_numpy(y_vec[None]).float().to(device)
 
     if seed >= 0:
@@ -197,13 +242,20 @@ def process_sample(img_id: int,
 
     stem = f'gauss_{img_id:04d}_{body_name}_img{img_id}'
     save_raw_outputs(out_dir, stem, i_error_gen, i_metal_gen_hu, i_clean_raw, i_art_raw)
+    # Conditioning actually used -> eval_localization.py evaluates against exactly these
+    img_dir = out_dir / 'raw' / 'img'
+    (img_dir / f'{stem}_metal_mask.raw').write_bytes(m_metal_n.astype(np.float32).tobytes())
+    if i_prior is not None:
+        (img_dir / f'{stem}_prior.raw').write_bytes(i_prior.astype(np.float32).tobytes())
     save_metadata(out_dir, stem, img_id, body_name, y_vec, feature_cols,
-                  error_scale, actual_seed, metalinfo)
+                  error_scale, actual_seed, metalinfo, extra=extra_meta)
 
     panels = []
 
     panels.append((i_clean_n,   'I_clean\n(input)',        'gray', (-1, 1)))
-    panels.append((m_metal_n,   'M_metal\n(metal mask)',   'hot',  (0, 1)))
+    if i_prior is not None:
+        panels.append((i_prior, 'I_prior\n(condition)', 'RdBu', (-1, 1)))
+    panels.append((m_metal_n,   f'M_metal\n({mask_source})', 'hot',  (0, 1)))
     panels.append((i_error_gen, 'Gen I_error\n(model output)', 'RdBu', (-1, 1)))
 
     panels.append((normalize_ct(i_metal_gen_hu), 'Gen CT\n(I_clean + gen artifact)', 'gray', (-1, 1)))
@@ -292,11 +344,10 @@ def format_metalinfo(info: dict | None) -> str:
 
 # ── Pair discovery ─────────────────────────────────────────────────────────────
 
-def find_pairs(body_dir: Path) -> list[dict]:
+def find_pairs(body_dir: Path, mask_dirs=METAL_MASK_DIRS) -> list[dict]:
     """Return sorted list of {img_id, clean_path, art_path, metal_path, metalinfo_path}."""
     baseline = body_dir / 'Baseline'
     target   = body_dir / 'Target'
-    metal    = body_dir / 'Metal'
     mask_dir = body_dir / 'Mask'
 
     if not target.exists():
@@ -314,14 +365,13 @@ def find_pairs(body_dir: Path) -> list[dict]:
             continue
 
         art_p      = baseline / f'training_body_metalart_img{iid}_512x512x1.raw'
-        metal_p    = metal    / f'training_body_metalonlymask_img{iid}_512x512x1.raw'
         metalinfo_p = mask_dir / f'training_body_metalinfo{iid}.json'
 
         pairs.append({
             'img_id':       iid,
             'clean_path':   clean_p,
             'art_path':     art_p       if art_p.exists()       else None,
-            'metal_path':   metal_p     if metal_p.exists()     else None,
+            'metal_path':   find_metal_mask(body_dir, iid, mask_dirs),
             'metalinfo_path': metalinfo_p if metalinfo_p.exists() else None,
         })
 
@@ -410,6 +460,16 @@ def main():
             '  --feature-cols peak_amplitude spatial_extent bbox_ratio'
         )
     )
+    parser.add_argument(
+        '--mask-file', type=Path, default=None,
+        help='Binary metal mask (.raw 512x512 float32 or .npy) used for ALL samples\n'
+             'instead of each sample\'s own mask. Prior models compute I_prior from it.'
+    )
+    parser.add_argument(
+        '--prior-file', type=Path, default=None,
+        help='Ready I_prior (.npy/.raw, model-input scale) used for ALL samples.\n'
+             'Prior models only; overrides --mask-file for the condition.'
+    )
 
     args = parser.parse_args()
 
@@ -447,7 +507,25 @@ def main():
     # ── Load model and features ────────────────────────────────────────────────
     print(f'Loading model: {model_path}')
     ddpm, feature_cols, in_ch = load_model(model_path, cfg, device)
-    use_metal_mask = (in_ch == 3)
+    model_cfg = load_model_config(model_path) or {}
+
+    # Prior / mask parameters come from the checkpoint's training config, not from
+    # the current config.toml (falls back to config.toml only for old models).
+    prior_params = None
+    if model_cfg.get('use_prior'):
+        prior_params = PriorParams(**model_cfg['prior'])
+        print(f'  Prior model: {prior_params.to_dict()}')
+        if prior_params.norm == 'global' and not prior_params.global_scale:
+            sys.exit('model_config prior norm=global but no global_scale stored.')
+    elif args.prior_file:
+        sys.exit('--prior-file given but the model was not trained with use_prior=True.')
+    use_metal_mask     = (in_ch == 3) and prior_params is None
+    error_scale        = model_cfg.get('error_scale', error_scale)
+    metal_threshold_hu = model_cfg.get('metal_threshold_hu', metal_threshold_hu)
+    mask_dirs          = model_cfg.get('metal_mask_dirs',
+                                       gaus_cfg.get('metal_mask_dirs', METAL_MASK_DIRS))
+    mask_override  = load_array(args.mask_file)  if args.mask_file  else None
+    prior_override = load_array(args.prior_file) if args.prior_file else None
 
     # --feature-cols overrides auto-detected feature_cols (use for ablation models)
     if args.feature_cols:
@@ -481,7 +559,7 @@ def main():
             continue
 
         feat_ids = set(body_feats.index.tolist())
-        pairs    = find_pairs(body_dir)
+        pairs    = find_pairs(body_dir, mask_dirs)
         pairs    = [p for p in pairs if p['img_id'] in feat_ids]
         if args.start_img > 0:
             pairs = [p for p in pairs if p['img_id'] >= args.start_img]
@@ -526,6 +604,9 @@ def main():
             out_dir=args.out,
             use_metal_mask=use_metal_mask,
             seed=args.seed + idx if args.seed >= 0 else -1,
+            prior_params=prior_params,
+            mask_override=mask_override,
+            prior_override=prior_override,
         )
 
     print(f'\nDone. Results saved to: {args.out}/')

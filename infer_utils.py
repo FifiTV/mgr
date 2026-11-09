@@ -31,17 +31,55 @@ def load_raw(path: Path) -> np.ndarray:
 
 # ── Model ──────────────────────────────────────────────────────────────────────
 
+MODEL_CONFIG_FILE = 'model_config.json'
+
+
+def load_model_config(model_path: Path) -> dict | None:
+    """Return the training-time model config of a checkpoint, or None (old models).
+
+    Looks for (in order):
+      1. 'model_config' embedded in a checkpoint.pth dict
+      2. model_config.json next to the weights file
+      3. model_config.json in the run directory of checkpoints/gaussian/epoch_XXXX/
+    """
+    import json
+    model_path = Path(model_path)
+    try:
+        raw = torch.load(model_path, map_location='cpu', weights_only=False)
+        if isinstance(raw, dict) and isinstance(raw.get('model_config'), dict):
+            return raw['model_config']
+    except Exception:
+        pass
+    for d in (model_path.parent, *list(model_path.parents)[1:4]):
+        p = d / MODEL_CONFIG_FILE
+        if p.exists():
+            with open(p) as f:
+                return json.load(f)
+    return None
+
+
 def load_model(model_path: Path, cfg: dict,
-               device: torch.device) -> tuple[GaussianDDPM, list[str]]:
+               device: torch.device) -> tuple[GaussianDDPM, list[str], int]:
     """Load GaussianDDPM from checkpoint, preferring EMA weights.
 
-    Returns (ddpm, feature_cols).
+    Returns (ddpm, feature_cols, in_ch).
+    Architecture / feature list come from the checkpoint's model_config when present
+    (models trained after the prior change), otherwise from cfg (old models).
     Handles both:
       - flat EMA dict  {param_name: tensor}         (gaussian_unet_ema.pth)
       - checkpoint     {epoch, model_state, ema_state, ...}  (checkpoint.pth)
     """
-    gaus = cfg.get('gaussian', {})
+    gaus = dict(cfg.get('gaussian', {}))
     feature_cols = gaus.get('feature_cols', None) or FEATURE_COLS
+    mc = load_model_config(model_path)
+    if mc is not None:
+        for k in ('base_channels', 't_emb_dim', 'attn_heads', 'T',
+                  'beta_schedule', 'beta_start', 'beta_end'):
+            if k in mc:
+                gaus[k] = mc[k]
+        feature_cols = list(mc.get('feature_cols') or feature_cols)
+        print(f'  model_config: use_prior={mc.get("use_prior")}  in_ch={mc.get("in_ch")}  '
+              f'features={feature_cols}')
 
     # Detect y_dim from checkpoint before building the model — handles ablation
     # models trained with fewer features (e.g. 3 instead of 6).
@@ -160,7 +198,7 @@ def ddpm_sample(ddpm: GaussianDDPM,
     stride>1  → custom loop skipping steps (faster, slightly lower quality).
 
     Args:
-        condition: [B, 2, H, W]  (I_clean_norm cat M_metal)
+        condition: [B, C, H, W]  I_clean_norm [+ M_metal | I_prior]
         y_target:  [B, y_dim]    feature vector in [0, 1]
         stride:    1 = full 1000 steps; 10 ≈ 10× faster
         seed:      if given, sets CPU + CUDA RNG before sampling
