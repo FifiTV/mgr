@@ -109,6 +109,28 @@ error_scale          = 642.8 # P75 of per-image P99.5 of |I_error| (12374 images
 feature_cols    = ["peak_amplitude", "spatial_extent", "bbox_ratio",
                    "dark_to_bright_ratio", "angular_concentration",
                    "texture_roughness"]  # add "tau" to include it
+# Where the metalonlymask files are searched (in order); fallback = metal_threshold_hu.
+# Old lookup was ["Metal"] only; locally the files live in Mask/.
+metal_mask_dirs = ["Metal", "Mask"]
+# Physical artifact prior as 3rd input channel: [x_t, I_clean, I_prior].
+# true  -> uses [gaussian.prior]; p_random_metal forced to 0; use_metal_mask ignored.
+# false -> legacy variant (M_metal channel or in_ch=2), unchanged.
+use_prior       = false
+
+[gaussian.prior]
+# I_prior = iradon(-beta * radon(M * mu_scale)^2)   (src/physics/artifact_prior.py)
+n_angles          = 360          # projections over [0, 180) deg, same theta in radon/iradon
+mu_scale          = 1.0          # NOTE: with per_image/global norm mu_scale and beta cancel out
+beta              = 1.0
+geometry          = "parallel"   # only "parallel" implemented (skimage); AAPM sim is fan-beam
+norm              = "per_image"  # "per_image" (max|I_prior|=1) or "global" (train-set constant)
+global_percentile = 99.0         # norm="global": percentile of per-image max|I_prior|
+transform         = "none"       # "none" or "signed_log" (compress: streaks are ~1-5% of max)
+log_k             = 100.0
+cache_dir         = "results/priors"   # written by precompute_priors.py
+# y vector for the prior variant: intensity / texture only. Geometric features
+# (spatial_extent, bbox_ratio, angular_concentration) duplicate I_prior -> shortcut.
+features_used     = ["peak_amplitude", "dark_to_bright_ratio", "texture_roughness"]
 
 [preprocessing]
 # Normalization for CT images

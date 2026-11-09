@@ -131,6 +131,20 @@ def main():
              'UNet uses in_ch=2 instead of 3. '
              'Equivalent to use_metal_mask=false in config [gaussian].'
     )
+    parser.add_argument(
+        '--use-prior',
+        action='store_true',
+        default=False,
+        help='Gaussian only: condition on [x_t, I_clean, I_prior] (physical artifact prior). '
+             'Equivalent to use_prior=true in config [gaussian]. Requires cached priors '
+             '(precompute_priors.py). Trains from scratch.'
+    )
+    parser.add_argument(
+        '--prior-dir',
+        type=str,
+        default=None,
+        help='Gaussian only: prior cache directory (overrides [gaussian.prior].cache_dir).'
+    )
 
     args = parser.parse_args()
 
@@ -146,9 +160,10 @@ def main():
         config['dataset']['batch_size'] = args.batch_size
         config.setdefault('gaussian', {})['batch_size'] = args.batch_size
     if args.features:
-        config.setdefault('gaussian', {})['feature_cols'] = [
-            f.strip() for f in args.features.split(',')
-        ]
+        _feats = [f.strip() for f in args.features.split(',')]
+        config.setdefault('gaussian', {})['feature_cols'] = _feats
+        # CLI also wins over [gaussian.prior].features_used in the prior variant
+        config['gaussian'].setdefault('prior', {})['features_used'] = _feats
 
     # Resolve output paths: CLI > config > hardcoded fallback
     paths_cfg  = config.get('paths', {})
@@ -267,6 +282,10 @@ def main():
                 config.setdefault('gaussian', {})['metal_dt_enabled'] = False
             if args.no_metal_mask:
                 config.setdefault('gaussian', {})['use_metal_mask'] = False
+            if args.use_prior:
+                config.setdefault('gaussian', {})['use_prior'] = True
+            if args.prior_dir:
+                config.setdefault('gaussian', {}).setdefault('prior', {})['cache_dir'] = args.prior_dir
 
             rpi_base = rpi_path or data_path
 

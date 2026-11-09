@@ -39,7 +39,15 @@ import torch
 from scipy.ndimage import distance_transform_edt
 from torch.utils.data import Dataset
 
+from src.physics.artifact_prior import (
+    PriorParams, finalize_prior, global_scale_from, prior_filename,
+)
+from src.physics.metal_mask import METAL_MASK_DIRS, find_metal_mask
+
 logger = logging.getLogger(__name__)
+
+PRIOR_SCALES_FILE = 'prior_scales.json'
+PRIOR_PARAMS_FILE = 'prior_params.json'
 
 SHAPE       = (512, 512)
 FEATURE_COLS = [
@@ -181,13 +189,20 @@ class GaussianDataset(Dataset):
     Each sample returns:
         i_clean  : [1, 512, 512]  clean CT image normalized to [-1, 1]
         i_error  : [1, 512, 512]  I_metal - I_clean normalized to [-1, 1]
-        m_metal  : [1, 512, 512]  binary metal mask [0, 1]
+        m_metal  : [1, 512, 512]  metal mask / distance field [0, 1]   (use_prior=False)
+        i_prior  : [1, 512, 512]  analytic artifact prior, from cache  (use_prior=True)
         y        : [F]            normalized feature vector (F = len(feature_cols))
+
+    All tensors of one sample come from the SAME image (i_prior / m_metal are paired
+    with that sample's i_clean and i_error) — except under random metal swap, which
+    is forced off in the prior variant.
 
     Directory structure per body variant:
         <body_dir>/Baseline/  training_body_metalart_imgN_512x512x1.raw
         <body_dir>/Target/    training_body_nometal_imgN_512x512x1.raw
-        <body_dir>/Metal/     training_body_metalonlymask_imgN_512x512x1.raw  (optional)
+        <body_dir>/{Metal,Mask}/ training_body_metalonlymask_imgN_512x512x1.raw  (optional)
+        <prior_dir>/<body>/   training_body_metalonlymask_imgN_512x512x1.prior.npy
+                              (precompute_priors.py; required when use_prior=True)
     """
 
     def __init__(self,
@@ -199,7 +214,11 @@ class GaussianDataset(Dataset):
                  use_distance_transform: bool = True,
                  error_scale: float = 642.8,
                  preload: bool = False,
-                 feature_cols: Optional[List[str]] = None):
+                 feature_cols: Optional[List[str]] = None,
+                 metal_mask_dirs: Optional[List[str]] = None,
+                 use_prior: bool = False,
+                 prior_dir: Optional[Union[str, Path]] = None,
+                 prior_params: Optional[PriorParams] = None):
         """
         Args:
             body_dirs        : list of paths to body variant directories
@@ -217,7 +236,28 @@ class GaussianDataset(Dataset):
                                Defaults to FEATURE_COLS (all 7 available features).
             preload          : if True, all .raw files are loaded into RAM at init.
                                Fast for small datasets; skip for large ones (>50 GB).
+            metal_mask_dirs  : sub-directories searched for the metalonlymask file
+                               (default ('Metal', 'Mask')); fallback = HU threshold.
+            use_prior        : return 'i_prior' (cached analytic prior) instead of 'm_metal'.
+                               Forces p_random_metal = 0.
+            prior_dir        : cache root written by precompute_priors.py.
+            prior_params     : PriorParams (norm / transform / global_scale). With
+                               norm='global' and global_scale=None the constant is
+                               computed from THIS dataset (= training set) and stored
+                               in self.prior_params.global_scale.
         """
+        self.use_prior    = use_prior
+        self.prior_params = prior_params or PriorParams()
+        self.metal_mask_dirs = tuple(metal_mask_dirs or METAL_MASK_DIRS)
+        if use_prior:
+            if prior_dir is None:
+                raise ValueError('use_prior=True requires prior_dir (run precompute_priors.py).')
+            if p_random_metal > 0.0:
+                logger.warning(f'use_prior=True: p_random_metal={p_random_metal} ignored -> 0.0 '
+                               '(the prior must stay paired with its own I_error).')
+            p_random_metal = 0.0
+            prior_dir = Path(prior_dir)
+            self._check_prior_cache_params(prior_dir)
         self.p_random_metal         = p_random_metal
         self.metal_threshold_hu     = metal_threshold_hu
         self.metal_dt_radius        = metal_dt_radius
@@ -249,6 +289,13 @@ class GaussianDataset(Dataset):
 
             feat_ids = set(body_feats.index.tolist())
 
+            prior_scales = {}
+            if use_prior:
+                scales_path = prior_dir / body_name / PRIOR_SCALES_FILE
+                if scales_path.exists():
+                    with open(scales_path) as f:
+                        prior_scales = json.load(f)
+
             def _img_id(p: Path) -> Optional[int]:
                 m = re.search(r'img(\d+)', p.stem)
                 return int(m.group(1)) if m else None
@@ -262,17 +309,24 @@ class GaussianDataset(Dataset):
                 if not clean_path.exists():
                     continue
 
-                metal_path = metal_dir / f'training_body_metalonlymask_img{img_id}_512x512x1.raw'
-                metal_path = metal_path if metal_path.exists() else None
+                metal_path = find_metal_mask(body_dir, img_id, self.metal_mask_dirs)
 
                 row = body_feats.loc[img_id, self.feature_cols].values.astype(np.float32)
 
-                self._records.append({
+                rec = {
+                    'img_id':     img_id,
+                    'body':       body_name,
                     'art_path':   art_path,
                     'clean_path': clean_path,
                     'metal_path': metal_path,
                     'y':          row,
-                })
+                }
+                if use_prior:
+                    rec['prior_path']  = prior_dir / body_name / prior_filename(img_id)
+                    scale_info         = prior_scales.get(str(img_id))
+                    rec['prior_scale'] = scale_info['raw_max_abs'] if scale_info else None
+                    rec['prior_mask_source'] = scale_info['mask_source'] if scale_info else None
+                self._records.append(rec)
                 self._all_metal_paths.append(metal_path)
 
         if not self._records:
@@ -282,6 +336,65 @@ class GaussianDataset(Dataset):
         logger.info(f"GaussianDataset: {len(self._records)} samples from "
                     f"{len(body_dirs)} body dir(s), y_dim={len(self.feature_cols)}")
         logger.info(f"  feature_cols: {self.feature_cols}")
+
+        n_file = sum(r['metal_path'] is not None for r in self._records)
+        logger.info(f"  metal mask: {n_file} from file {self.metal_mask_dirs}, "
+                    f"{len(self._records) - n_file} from threshold fallback")
+
+        if use_prior:
+            self._validate_prior_cache(prior_dir)
+
+    # ── Prior cache ──────────────────────────────────────────────────────────────
+
+    def _check_prior_cache_params(self, prior_dir: Path) -> None:
+        """Refuse a cache computed with different geometry parameters."""
+        params_path = prior_dir / PRIOR_PARAMS_FILE
+        if not params_path.exists():
+            raise FileNotFoundError(
+                f'Prior cache parameters not found: {params_path}\n'
+                f'Run: python precompute_priors.py --data-dir <RPI> --out-dir {prior_dir}')
+        with open(params_path) as f:
+            cached = json.load(f)
+        expected = self.prior_params.geometry_key()
+        if cached != expected:
+            raise ValueError(f'Prior cache {prior_dir} was computed with different parameters.\n'
+                             f'  cache : {cached}\n  config: {expected}')
+
+    def _validate_prior_cache(self, prior_dir: Path) -> None:
+        missing = [r for r in self._records
+                   if not r['prior_path'].exists() or r['prior_scale'] is None]
+        if missing:
+            names = '\n  '.join(str(r['prior_path']) for r in missing[:10])
+            raise FileNotFoundError(
+                f'{len(missing)} prior file(s) missing in cache {prior_dir} '
+                f'(or absent from {PRIOR_SCALES_FILE}), e.g.:\n  {names}\n'
+                f'Run: python precompute_priors.py --data-dir <RPI> --out-dir {prior_dir} '
+                f'--bodies {" ".join(sorted({r["body"] for r in missing}))}')
+
+        sources = {}
+        for r in self._records:
+            k = (r['prior_mask_source'] or '?').split(':')[0]
+            sources[k] = sources.get(k, 0) + 1
+        logger.info(f"  prior cache: {prior_dir}  mask sources: {sources}")
+        if sources.get('threshold'):
+            logger.warning(f"  {sources['threshold']} prior(s) computed from the HU-threshold "
+                           f"fallback mask (no metalonlymask file).")
+
+        p = self.prior_params
+        if p.norm == 'global' and not p.global_scale:
+            p.global_scale = global_scale_from([r['prior_scale'] for r in self._records],
+                                               p.global_percentile)
+            logger.info(f"  prior global_scale = {p.global_scale:.4f} "
+                        f"(P{p.global_percentile:g} of per-image max|I_prior|, this dataset)")
+        logger.info(f"  prior norm={p.norm}  transform={p.transform}")
+
+    def _load_prior(self, rec: dict) -> np.ndarray:
+        path = rec['prior_path']
+        if not path.exists():
+            raise FileNotFoundError(f'Prior file missing: {path} '
+                                    f'(run precompute_priors.py; priors are never computed on the fly)')
+        unit = np.load(path).astype(np.float32)
+        return finalize_prior(unit, rec['prior_scale'], self.prior_params)
 
     def __len__(self) -> int:
         return len(self._records)
@@ -325,6 +438,21 @@ class GaussianDataset(Dataset):
         # I_error in HU before normalization (needed for proper error clipping)
         i_error = i_art - i_clean
 
+        # Normalize
+        i_clean_n = normalize_ct(i_clean)
+        i_error_n = normalize_error(i_error, scale=self.error_scale)
+
+        out = {
+            'i_clean': torch.from_numpy(i_clean_n[None]).float(),  # [1, H, W]
+            'i_error': torch.from_numpy(i_error_n[None]).float(),  # [1, H, W]
+            'y':       torch.from_numpy(rec['y']).float(),         # [F]
+        }
+
+        if self.use_prior:
+            # Prior of THIS sample (paired with its i_clean / i_error). No swap.
+            out['i_prior'] = torch.from_numpy(self._load_prior(rec)[None]).float()
+            return out
+
         # Metal mask
         m_metal = self._get_metal_mask(rec)
 
@@ -333,13 +461,5 @@ class GaussianDataset(Dataset):
             swap_idx = np.random.randint(len(self._records))
             m_metal  = self._get_metal_mask(self._records[swap_idx])
 
-        # Normalize
-        i_clean_n = normalize_ct(i_clean)
-        i_error_n = normalize_error(i_error, scale=self.error_scale)
-
-        return {
-            'i_clean': torch.from_numpy(i_clean_n[None]).float(),  # [1, H, W]
-            'i_error': torch.from_numpy(i_error_n[None]).float(),  # [1, H, W]
-            'm_metal': torch.from_numpy(m_metal[None]).float(),    # [1, H, W]
-            'y':       torch.from_numpy(rec['y']).float(),         # [6]
-        }
+        out['m_metal'] = torch.from_numpy(m_metal[None]).float()  # [1, H, W]
+        return out

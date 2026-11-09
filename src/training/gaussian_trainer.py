@@ -24,8 +24,21 @@ from torch.utils.data import DataLoader
 
 from src.models.gaussian_unet import GaussianUNet, GaussianDDPM
 from src.datasets.gaussian_dataset import GaussianDataset, load_features_df, FEATURE_COLS
+from src.physics.artifact_prior import PriorParams, DEFAULT_PRIOR_FEATURES, GEOMETRIC_FEATURES
+from src.physics.metal_mask import METAL_MASK_DIRS
 
 logger = logging.getLogger(__name__)
+
+MODEL_CONFIG_FILE = 'model_config.json'
+
+
+def resolve_feature_cols(gaus_cfg: dict, use_prior: bool) -> list:
+    """y columns: prior variant -> [gaussian.prior].features_used (default: intensity/texture
+    only); legacy variant -> [gaussian].feature_cols. Columns are selected from the already
+    normalized features table (robust_normalize is unchanged)."""
+    if use_prior:
+        return list(gaus_cfg.get('prior', {}).get('features_used') or DEFAULT_PRIOR_FEATURES)
+    return list(gaus_cfg.get('feature_cols', None) or FEATURE_COLS)
 
 
 # ── EMA ──────────────────────────────────────────────────────────────────────────
@@ -112,11 +125,16 @@ def generate_samples(ddpm: GaussianDDPM,
                      save_dir: str,
                      epoch: int,
                      device: torch.device,
-                     y_dim: int = 6) -> None:
+                     y_dim: int = 6,
+                     amp_idx: int = 0,
+                     cond_name: str = 'M_metal') -> None:
     """
     Generate visual sanity-check samples using EMA weights for two fixed y_target:
-        y_low  = [0.2, 0.5, ..., 0.5]  -- low peak_amplitude
-        y_high = [0.8, 0.5, ..., 0.5]  -- high peak_amplitude
+        y_low  = [0.5, ..., 0.2 (peak_amplitude), ..., 0.5]
+        y_high = [0.5, ..., 0.8 (peak_amplitude), ..., 0.5]
+
+    amp_idx   : index of peak_amplitude in the feature vector.
+    cond_name : 'M_metal' or 'I_prior' -- label/colormap of the 2nd condition channel.
 
     EMA weights are temporarily swapped in and restored after sampling.
     """
@@ -136,7 +154,7 @@ def generate_samples(ddpm: GaussianDDPM,
 
     for label, amp in [('low', 0.2), ('high', 0.8)]:
         y_vals      = [0.5] * y_dim
-        y_vals[0]   = amp  # peak_amplitude is always first feature
+        y_vals[amp_idx] = amp
         y_target    = torch.tensor(y_vals, dtype=torch.float32, device=device).unsqueeze(0).expand(B, -1)
         i_error_gen = ddpm.sample(cond, y_target)          # [B, 1, H, W]
 
@@ -150,7 +168,10 @@ def generate_samples(ddpm: GaussianDDPM,
             axes[0].set_title('I_clean')
             axes[0].axis('off')
 
-            if has_mask:
+            if has_mask and cond_name == 'I_prior':
+                axes[1].imshow(cond[i, 1].cpu().numpy(), cmap='RdBu', vmin=-1, vmax=1)
+                axes[1].set_title('I_prior')
+            elif has_mask:
                 axes[1].imshow(cond[i, 1].cpu().numpy(), cmap='Reds', vmin=0, vmax=1)
                 axes[1].set_title('M_metal')
             else:
@@ -194,6 +215,12 @@ def train_gaussian(config: dict,
         body_dirs       : list of body variant directories (each with Baseline/Target/Metal/)
         features_source : path to a single CSV or a directory with body*/features.csv
         clip_stats_path : path to feature_clip_stats.json (needed if features are raw)
+
+    Conditioning variants (3rd UNet input channel):
+        use_prior=True        -> [x_t, I_clean, I_prior]   (cached analytic prior)
+        use_metal_mask=True   -> [x_t, I_clean, M_metal]   (legacy)
+        both False            -> [x_t, I_clean]            (in_ch=2)
+    Always trained from scratch; no checkpoint loading.
     """
     logger.info("=" * 60)
     logger.info("Gaussian Vicinal DDPM Training")
@@ -219,17 +246,42 @@ def train_gaussian(config: dict,
     metal_dt_radius     = gaus_cfg.get('metal_dt_radius', 200.0)
     metal_dt_enabled    = gaus_cfg.get('metal_dt_enabled', True)
     use_metal_mask      = gaus_cfg.get('use_metal_mask', True)
+    use_prior           = bool(gaus_cfg.get('use_prior', False))
+    prior_cfg           = gaus_cfg.get('prior', {})
+    metal_mask_dirs     = list(gaus_cfg.get('metal_mask_dirs', METAL_MASK_DIRS))
     error_scale         = gaus_cfg.get('error_scale', 310.5)
     checkpoint_interval = config.get('training', {}).get('checkpoint_interval', 10)
     num_workers         = config.get('dataset', {}).get('num_workers', 2)
     sample_interval     = gaus_cfg.get('sample_interval', 1)
-    feature_cols        = gaus_cfg.get('feature_cols', None) or FEATURE_COLS
+    feature_cols        = resolve_feature_cols(gaus_cfg, use_prior)
     y_dim               = len(feature_cols)
+
+    prior_params, prior_dir = None, None
+    if use_prior:
+        if use_metal_mask:
+            logger.info("use_prior=True -> 3rd channel is I_prior; use_metal_mask ignored.")
+            use_metal_mask = False
+        if p_random_metal > 0:
+            logger.info(f"use_prior=True -> random metal swap disabled (was {p_random_metal}).")
+            p_random_metal = 0.0
+        prior_params = PriorParams.from_config(prior_cfg)
+        prior_dir    = prior_cfg.get('cache_dir')
+        if not prior_dir:
+            raise ValueError("use_prior=True requires [gaussian.prior].cache_dir "
+                             "(or train.py --prior-dir).")
+        geo = sorted(set(feature_cols) & GEOMETRIC_FEATURES)
+        if geo:
+            logger.warning(f"Prior variant with geometric features {geo}: they duplicate the "
+                           f"geometry of I_prior and may become a shortcut.")
+    in_ch = 3 if (use_prior or use_metal_mask) else 2
 
     logger.info(f"T={T}, beta_schedule={beta_schedule}, epochs={n_epochs}, "
                 f"batch={batch_size}, lr={lr}")
     logger.info(f"sigma: {sigma_max} -> {sigma_min} (cosine)")
-    logger.info(f"p_random_metal={p_random_metal}, ema_decay={ema_decay}, use_metal_mask={use_metal_mask}")
+    logger.info(f"p_random_metal={p_random_metal}, ema_decay={ema_decay}, "
+                f"use_metal_mask={use_metal_mask}, use_prior={use_prior}, in_ch={in_ch}")
+    if use_prior:
+        logger.info(f"prior: {prior_params.to_dict()}  cache={prior_dir}")
     logger.info(f"feature_cols ({y_dim}): {feature_cols}")
 
     os.makedirs(output_dir, exist_ok=True)
@@ -250,6 +302,10 @@ def train_gaussian(config: dict,
         use_distance_transform=metal_dt_enabled,
         error_scale=error_scale,
         feature_cols=feature_cols,
+        metal_mask_dirs=metal_mask_dirs,
+        use_prior=use_prior,
+        prior_dir=prior_dir,
+        prior_params=prior_params,
     )
     dataloader = DataLoader(
         dataset,
@@ -261,9 +317,43 @@ def train_gaussian(config: dict,
     )
     logger.info(f"DataLoader: {len(dataset)} samples, {len(dataloader)} batches/epoch")
 
+    # ── Model config (read back by infer_utils.load_model) ───────────────────────
+    # Written before training so interrupted runs are still loadable. With
+    # prior norm='global', global_scale has just been computed on the training set.
+    model_config = {
+        'in_ch':          in_ch,
+        'use_prior':      use_prior,
+        'use_metal_mask': use_metal_mask,
+        'feature_cols':   list(feature_cols),
+        'base_channels':  base_ch,
+        't_emb_dim':      t_emb_dim,
+        'attn_heads':     attn_heads,
+        'T':              T,
+        'beta_schedule':  beta_schedule,
+        'beta_start':     beta_start,
+        'beta_end':       beta_end,
+        'error_scale':    error_scale,
+        'metal_mask_dirs':    metal_mask_dirs,
+        'metal_threshold_hu': metal_threshold_hu,
+        'metal_dt_enabled':   metal_dt_enabled,
+        'metal_dt_radius':    metal_dt_radius,
+        'prior':          dataset.prior_params.to_dict() if use_prior else None,
+        'prior_cache_dir': str(prior_dir) if use_prior else None,
+    }
+    with open(os.path.join(output_dir, MODEL_CONFIG_FILE), 'w') as f:
+        json.dump(model_config, f, indent=2)
+    logger.info(f"Model config: {os.path.join(output_dir, MODEL_CONFIG_FILE)}")
+    if use_prior and dataset.prior_params.norm == 'global':
+        with open(os.path.join(output_dir, 'prior_norm.json'), 'w') as f:
+            json.dump({'norm': 'global',
+                       'global_scale': dataset.prior_params.global_scale,
+                       'global_percentile': dataset.prior_params.global_percentile,
+                       'computed_on': [str(b) for b in body_dirs],
+                       'n_images': len(dataset)}, f, indent=2)
+
     # ── Model ─────────────────────────────────────────────────────────────────────
     unet = GaussianUNet(
-        in_ch=3 if use_metal_mask else 2, out_ch=1,
+        in_ch=in_ch, out_ch=1,
         base_ch=base_ch,
         t_emb_dim=t_emb_dim,
         y_dim=y_dim,
@@ -302,7 +392,10 @@ def train_gaussian(config: dict,
     _vis = [dataset[i] for i in range(_n_vis)]
     dataset.p_random_metal = _p_save
     _i_clean_vis = torch.stack([s['i_clean'] for s in _vis])
-    if use_metal_mask:
+    if use_prior:
+        _prior_vis = torch.stack([s['i_prior'] for s in _vis])
+        sample_condition = torch.cat([_i_clean_vis, _prior_vis], dim=1).cpu()
+    elif use_metal_mask:
         _m_metal_vis = torch.stack([s['m_metal'] for s in _vis])
         sample_condition = torch.cat([_i_clean_vis, _m_metal_vis], dim=1).cpu()
     else:
@@ -320,10 +413,18 @@ def train_gaussian(config: dict,
         for batch_idx, batch in enumerate(dataloader):
             i_clean  = batch['i_clean'].to(device)   # [B, 1, H, W]
             i_error  = batch['i_error'].to(device)   # [B, 1, H, W]
-            m_metal  = batch['m_metal'].to(device)   # [B, 1, H, W]
-            y_i      = batch['y'].to(device)         # [B, 6]
+            y_i      = batch['y'].to(device)         # [B, F]
 
-            condition = torch.cat([i_clean, m_metal], dim=1) if use_metal_mask else i_clean
+            # Spatial condition is PER SAMPLE: row b of i_clean / i_prior / m_metal comes
+            # from the same dataset item as row b of i_error (-> x_t) and y_i. Only
+            # y_target (AdaLN) is shared across the batch.
+            if use_prior:
+                condition = torch.cat([i_clean, batch['i_prior'].to(device)], dim=1)
+            elif use_metal_mask:
+                condition = torch.cat([i_clean, batch['m_metal'].to(device)], dim=1)
+            else:
+                condition = i_clean
+            assert condition.shape[0] == i_error.shape[0] == y_i.shape[0]
 
             # Sample y_target as a random row from the current batch's feature vectors.
             # Using torch.rand would land in empty regions of feature space (U[0,1]^F
@@ -424,13 +525,18 @@ def train_gaussian(config: dict,
                 'optimizer_state': optimizer.state_dict(),
                 'sigma':          sigma,
                 'loss':           avg_loss,
+                'model_config':   model_config,
             }, os.path.join(ckpt_dir, 'checkpoint.pth'))
             logger.info(f"  Checkpoint saved: {ckpt_dir}")
 
         # ── Sample generation ─────────────────────────────────────────────────────
         if sample_interval > 0 and (epoch + 1) % sample_interval == 0:
             cond_batch = sample_condition.to(device)
-            generate_samples(ddpm, ema.state_dict(), cond_batch, sample_dir, epoch + 1, device, y_dim=y_dim)
+            generate_samples(ddpm, ema.state_dict(), cond_batch, sample_dir, epoch + 1, device,
+                             y_dim=y_dim,
+                             amp_idx=(feature_cols.index('peak_amplitude')
+                                      if 'peak_amplitude' in feature_cols else 0),
+                             cond_name='I_prior' if use_prior else 'M_metal')
 
     # ── Final weights ─────────────────────────────────────────────────────────────
     raw_path = os.path.join(output_dir, 'gaussian_unet.pth')
